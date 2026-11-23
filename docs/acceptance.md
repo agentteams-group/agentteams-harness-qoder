@@ -20,6 +20,8 @@ Recorded 2026-11-24. These results are separate evidence layers, not a productio
 6. A custom-model localhost gateway probe failed with a Qoder custom-model service error, and the local HTTP server observed no request. The tested account's catalog was restricted. This is failed gateway compatibility evidence, not proof that every Qoder account or endpoint is unsupported.
 7. All 30 local contract tests passed. They cover the actual SDK role schema, SDK/Core MCP namespace separation, tool IDs, read-only errors, unknown effects, file-path containment, coordination-phase tool restriction, transcript durability, Higress-only model selection, approval/run binding, delivery-only recovery and native telemetry content exclusion. [Hosted CI also passed on the implementation commit](https://github.com/agentteams-group/agentteams-harness-qoder/actions/runs/45218569520). CI runs the offline contracts without credentials.
 8. Core backend and controller package tests passed, including Qoder registration/projection and avoiding the QwenPaw console path. The narrower server/observability packages compiled and the selected runtime checks passed.
+9. Local Linux arm64 packaging passed with SDK `1.0.17`, bundled CLI `1.1.79`, the public `agt task` entrypoint and 30/30 offline tests inside the image with networking disabled. The final image is `agentteams/agentteams-harness-qoder:local-2cf28a8`, ID `sha256:a14cf5b8f906ccb18fb13ca1ad841f6dd5fde3fd7163d690ca056e963a4ac3b7`. All nine installed adapter Python files matched the source digests at `2cf28a82647fca1166b95203cc7486bb146c4997`. This is a local image, not a published release or a live Matrix deployment.
+10. The local build first installed the pinned SDK/Core dependencies using the repository Dockerfile, then refreshed the application package from the final source without changing those dependency inputs. Source/CLI/image checks were performed on the refreshed image. Build recipes and per-file digests are retained in the local task evidence directory.
 
 ## Still required
 
@@ -29,6 +31,6 @@ Recorded 2026-11-24. These results are separate evidence layers, not a productio
 - Exact submission review, role-mixed combinations, duplicate/concurrent inputs, rejection/rework, cancellations, approval rejection, upload/notification failure and unknown tool outcomes.
 - Real Worker restart, missing/expired session, both switch directions and a same-task round trip, preserving old native caches/cursors.
 - Collector-backed trace correlation and model/tool token completeness checks. Local exporter tests do not prove ingestion.
-- Linux amd64/arm64 packaging and formal image/deployment evidence. Record build outcomes separately from local native inference.
+- Linux amd64 packaging, formal publication and live deployment evidence. The local arm64 image checks above do not establish these layers.
 
 Until those gates pass, describe this repository as an experimental adapter and Core registration candidate. Do not claim full Harness admission, production readiness or an independently published image release.
