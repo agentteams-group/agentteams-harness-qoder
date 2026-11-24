@@ -1,4 +1,4 @@
-AT_REF := 63eb100e2f553b4cd629288718c898a6d7b3a7ed
+AT_REF := f08cd8291c4004479660addb16fc7ecd7d08c591
 AT_CONTEXT ?= https://github.com/agentscope-ai/AgentTeams.git\#$(AT_REF)
 AT_SOURCE ?= ../AgentTeams
 IMAGE ?= agentteams/agentteams-harness-qoder:local
