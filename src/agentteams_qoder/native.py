@@ -154,6 +154,9 @@ class NativeTurn:
             call_id = call_id or event.get("tool_use_id")
             before = event["hook_event_name"] == "PreToolUse"
             denied = event["hook_event_name"] == "PermissionDenied"
+            response = event.get("tool_response", event.get("error"))
+            failed = (event["hook_event_name"] == "PostToolUseFailure"
+                      or (isinstance(response, dict) and response.get("isError") is True))
             try:
                 if before:
                     await asyncio.to_thread(self.before, name, event.get("tool_input") or {}, call_id)
@@ -164,11 +167,10 @@ class NativeTurn:
                         await asyncio.to_thread(self.permission_denied, name, call_id, event.get("denial_reason", "Permission denied"))
                     else:
                         await asyncio.to_thread(self.after, name, call_id,
-                            event.get("tool_response", event.get("error")),
-                            failed=event["hook_event_name"] == "PostToolUseFailure",
+                            response, failed=failed,
                             interrupted=event.get("is_interrupt") is True)
                     if self.trace:
-                        self.trace.tool_end(call_id, denied or event["hook_event_name"] == "PostToolUseFailure")
+                        self.trace.tool_end(call_id, denied or failed)
             except Exception as error:
                 if not before:
                     if self.trace:
@@ -182,7 +184,7 @@ class NativeTurn:
             if self.display:
                 await self.display.tool(name, call_id, event.get("tool_input"),
                     result=None if before else event.get("tool_response", event.get("error", event.get("denial_reason", "Completed"))),
-                    failed=denied or event["hook_event_name"] == "PostToolUseFailure", finished=not before)
+                    failed=denied or failed, finished=not before)
             return {}
 
     async def stop(self, _event, _call_id, _options):

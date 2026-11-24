@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from agentteams_qoder.core import common
 from agentteams_qoder.native import NativeTurn, TASK_TOOL
@@ -88,6 +88,15 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"AGENTTEAMS_CONTROLLER_URL": ""}):
             self.turn.before(TASK_TOOL, {"action": "get"}, "call")
         self.recovery.begin_tools.assert_not_called()
+
+    async def test_structured_task_error_is_not_displayed_as_a_successful_tool(self):
+        self.turn.server()
+        self.turn.display = Mock(tool=AsyncMock())
+        result = await self.turn.hook({"hook_event_name": "PostToolUse", "tool_name": TASK_TOOL,
+            "tool_response": {"isError": True, "content": [{"type": "text", "text": "Invalid task arguments"}]}}, "native-task", None)
+        self.assertEqual(result, {})
+        self.assertTrue(self.turn.display.tool.await_args.kwargs["failed"])
+        self.recovery.finish_tools.assert_not_called()
 
     async def test_review_rejects_non_task_tools(self):
         self.turn.context["review"] = ["t", "submission"]
