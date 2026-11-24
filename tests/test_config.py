@@ -37,6 +37,12 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, "gateway"):
                 gateway_options({**model, field: ""})
 
+    def test_account_model_requires_explicit_operator_selection(self):
+        with patch.dict(os.environ,{"QODER_MODEL_ROUTE":"account"},clear=True):
+            self.assertEqual(gateway_options({}),{"model":"auto","settings":{},"env":{}})
+        with patch.dict(os.environ,{"QODER_MODEL_ROUTE":"unexpected"},clear=True):
+            with self.assertRaises(ValueError):gateway_options({})
+
     def test_projected_gateway_and_role(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
                 "AGENTTEAMS_WORKER_NAME": "worker", "AGENTTEAMS_WORKER_GATEWAY_KEY": "fixture-gateway", "AGENTTEAMS_WORKER_MATRIX_TOKEN": "fixture-matrix"}):
@@ -70,6 +76,18 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(allowed(config, "!team:test", event))
         config["desired"]["channelPolicy"] = {"groupDenyExtra": ["@human:test"]}
         self.assertFalse(allowed(config, "!team:test", event, control=True))
+
+    def test_task_room_ignores_progress_and_unaddressed_peer_messages(self):
+        config=record()
+        event={"sender":"@leader:test","content":{"msgtype":"m.text","body":"working"}}
+        self.assertFalse(allowed(config,"!task:test",event))
+        event["content"]["m.mentions"]={"user_ids":["@worker:test"]}
+        self.assertTrue(allowed(config,"!task:test",event))
+        event["content"]["org.agentteams.progress_only"]=True
+        self.assertFalse(allowed(config,"!task:test",event))
+        event["content"].pop("org.agentteams.progress_only")
+        event["content"]["org.agentteams.run"]={"blocks":[]}
+        self.assertFalse(allowed(config,"!task:test",event))
 
     def test_general_team_room_requires_structured_mention(self):
         config = record()

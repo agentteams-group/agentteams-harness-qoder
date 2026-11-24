@@ -98,6 +98,30 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.turn.display.tool.await_args.kwargs["failed"])
         self.recovery.finish_tools.assert_not_called()
 
+    async def test_validated_phase_completion_stops_at_native_tool_boundary(self):
+        self.turn.server()
+        outcome={"result":{"task":{"id":"t","status":"completed","spec":"large snapshot","submissionId":"s"}},
+                 "phaseComplete":True,"receiptId":"receipt","fact":"Submitted; downstream queued."}
+        with patch.object(self.turn,"admit"), patch.object(common(PLUGIN,"task_native"),"invoke",return_value=outcome):
+            result=await self.turn.task({"action":"submit","taskId":"t"})
+        self.assertNotIn("large snapshot",result['content'][0]['text'])
+        hook=await self.turn.hook({"hook_event_name":"PostToolUse","tool_name":TASK_TOOL,
+            "tool_response":result},"call-task",None)
+        self.assertIs(hook.get('continue_'),False)
+        self.assertEqual(self.turn.completion['receiptId'],'receipt')
+
+    async def test_real_sdk_joined_tool_text_is_a_native_receipt(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            store=SessionStore(Path(directory)/"sessions.sqlite")
+            key={"session_id":"session"}
+            content=json.dumps({"receiptId":"receipt-one"})+"\n[Task system receipt]\nSaved; downstream queued."
+            store.save(key,[{"uuid":"row","type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"call-task","content":content}]}}])
+            self.assertTrue(store.has_task_receipt("session","call-task","receipt-one"))
+            self.assertFalse(store.has_task_receipt("session","foreign-call","receipt-one"))
+            self.assertFalse(store.has_task_receipt("session","call-task","foreign-receipt"))
+
     async def test_review_rejects_non_task_tools(self):
         self.turn.context["review"] = ["t", "submission"]
         with self.assertRaisesRegex(ValueError, "only"):

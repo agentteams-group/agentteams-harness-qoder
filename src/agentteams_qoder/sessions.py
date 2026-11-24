@@ -70,3 +70,19 @@ class SessionStore:
             rows = db.execute("SELECT scope, identity, value FROM entries WHERE session=? ORDER BY sequence",
                               (session_id,)).fetchall()
         return hashlib.sha256(self.encode(rows).encode()).hexdigest() if rows else None
+
+    def has_task_receipt(self, session, call_id, receipt_id):
+        with self.connect() as db:
+            rows=db.execute("SELECT value FROM entries WHERE session=? ORDER BY sequence",(session,)).fetchall()
+        def matches(value):
+            if isinstance(value,dict):
+                if value.get("type")=="tool_result" and value.get("tool_use_id")==call_id:
+                    content=value.get("content",[])
+                    parts=[content] if isinstance(content,str) else [p.get("text","") for p in content if isinstance(p,dict)]
+                    for text in parts:
+                        try: parsed=json.JSONDecoder().raw_decode(text.lstrip())[0]
+                        except (ValueError,TypeError):continue
+                        if isinstance(parsed,dict) and parsed.get("receiptId")==receipt_id:return True
+                return any(matches(item) for item in value.values())
+            return isinstance(value,list) and any(matches(item) for item in value)
+        return any(matches(json.loads(row[0])) for row in rows)
