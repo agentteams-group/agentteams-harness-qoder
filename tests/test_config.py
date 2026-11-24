@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import yaml
 
-from agentteams_qoder.config import authentication, load, model_selection
+from agentteams_qoder.config import authentication, gateway_options, load
 from agentteams_qoder.transport import allowed
 
 
@@ -20,15 +20,22 @@ def record():
 
 
 class ConfigTests(unittest.TestCase):
-    def test_model_source_never_silently_falls_back(self):
-        with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(ValueError, "BYOK"):
-                model_selection({"model": "gateway-model"})
-        with patch.dict(os.environ, {"QODER_MODEL_SOURCE": "service", "QODER_MODEL": "auto"}, clear=True):
-            with self.assertRaisesRegex(ValueError, "BYOK"):
-                model_selection({"model": "gateway-model"})
-        with patch.dict(os.environ, {"QODER_BYOK_PROVIDER": "account-provider"}, clear=True):
-            self.assertEqual(model_selection({"model": "gateway-model"})["provider"], "account-provider")
+    def test_direct_gateway_uses_only_projected_configuration(self):
+        model = {"model": "gateway-model", "url": "https://gateway/v1", "api_key": "fixture-gateway"}
+        for env in ({}, {"QODER_BYOK_PROVIDER": "old-provider", "QODER_MODEL": "auto",
+                         "QODER_MODEL_SOURCE": "service"}):
+            with patch.dict(os.environ, env, clear=True):
+                options = gateway_options(model)
+            self.assertEqual(options["model"], "agentteams-gateway/gateway-model")
+            self.assertEqual(options["settings"], {"providers": {"agentteams-gateway": {
+                "type": "openai-compatible", "protocol": "openai", "model": "gateway-model",
+                "baseUrl": "https://gateway/v1", "apiKey": "fixture-gateway"}}})
+
+    def test_incomplete_gateway_fails_instead_of_selecting_account_model(self):
+        model = {"model": "gateway-model", "url": "https://gateway/v1", "api_key": "fixture-gateway"}
+        for field in model:
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "gateway"):
+                gateway_options({**model, field: ""})
 
     def test_projected_gateway_and_role(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {

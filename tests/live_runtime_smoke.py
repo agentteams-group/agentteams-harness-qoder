@@ -19,7 +19,7 @@ async def main():
         runtime = Runtime.__new__(Runtime)
         runtime.home, runtime.plugin = root, Path(os.environ["AT_SOURCE"]) / "plugins/teamharness"
         runtime.config, runtime.role = record(), "worker"
-        runtime.model = {"provider": "unused-service-mode", "model": "unused", "api_key": "fixture"}
+        runtime.model = {"model": "unused", "api_key": "fixture", "url": "http://unused/v1"}
         runtime.recovery, runtime.matrix = Mock(), Mock()
         runtime.client = Mock()
         runtime.matrix.message_current.return_value = {"execution": {"checkpoint": None}}
@@ -35,7 +35,7 @@ async def main():
         from worker_sessions import WorkerSessions
         cli = common(runtime.plugin, "task_cli")
         with patch.dict(os.environ, {"QODER_AUTH_MODE": "local", "AGENTTEAMS_CONTROLLER_URL": ""}), \
-                patch("agentteams_qoder.runtime.model_selection", return_value="auto"), \
+                patch("agentteams_qoder.runtime.gateway_options", return_value={"model": "auto", "settings": {}, "env": {}}), \
                 patch.object(WorkerSessions, "load", return_value=view), \
                 patch.object(WorkerSessions, "remember") as remember, \
                 patch.object(WorkerSessions, "usable", return_value=False), \
@@ -48,7 +48,9 @@ async def main():
             def options(**kwargs):
                 kwargs.pop("env")
                 return original(**kwargs)
-            with patch.object(qoder_agent_sdk, "QoderAgentOptions", side_effect=options):
+            with patch.object(qoder_agent_sdk, "QoderAgentOptions", side_effect=options), \
+                    patch.object(qoder_agent_sdk.QoderSDKClient, "get_available_models",
+                                 return_value=[{"value": "auto", "isEnabled": True}]):
                 async with asyncio.timeout(90):
                     answer = await runtime.execute(source, identity)
         assert answer == "NATIVE_RUNTIME_OK", answer

@@ -10,7 +10,7 @@ import time
 from urllib.parse import quote
 import uuid
 
-from .config import authentication, external_mcp, instructions, load, model_selection
+from .config import authentication, external_mcp, gateway_options, instructions, load
 from .core import common
 from .native import NativeTurn, TASK_TOOL
 from .sessions import SessionStore
@@ -185,6 +185,7 @@ class Runtime:
         from qoder_agent_sdk import QoderAgentOptions, QoderSDKClient, HookMatcher, ResultMessage, AssistantMessage
         from worker_sessions import WorkerSessions
 
+        gateway = gateway_options(self.model)
         context, text = await asyncio.to_thread(self.prepare, source, recovered=recovered)
         kind = "task" if recovered else "message"
         native = NativeTurn(self.plugin, context, recovery=self.recovery, matrix=self.matrix, kind=kind, identity=identity)
@@ -225,7 +226,7 @@ class Runtime:
         self.store.committed = committed
         async def resolve_model(_context):
             trace.model_start(_context)
-            return {"model": model_selection(self.model)}
+            return {"model": gateway["model"]}
 
         tools = [] if any(context.get(key) for key in ("planning", "review", "completion")) else ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
         options = QoderAgentOptions(cwd=(context.get("context") or {}).get("outputDirectory") or str(self.home / "workspace"),
@@ -239,11 +240,16 @@ class Runtime:
                 "PostToolUseFailure": [HookMatcher(hooks=[native.hook])],
                 "Stop": [HookMatcher(hooks=[native.stop])]},
             resolve_model=resolve_model, session_store=self.store, session_store_flush="eager",
-            env={"QODER_CONFIG_DIR": str(self.home / ".qoder")},
+            model=gateway["model"], settings=gateway["settings"],
+            env={**gateway["env"], "QODER_CONFIG_DIR": str(self.home / ".qoder")},
             resume=resume, session_id=None if resume else session_id, max_turns=50)
         answer = None
         try:
             async with QoderSDKClient(options=options) as client:
+                models = await client.get_available_models()
+                if not any(model.get("value") == gateway["model"] and model.get("isEnabled") for model in models):
+                    raise RuntimeError("Qoder did not enable the projected OpenAI-compatible gateway model; "
+                                       "check Qoder SDK custom-endpoint support and account permissions")
                 peers = {member.get("matrixUserId") for member in self.config.get("team", {}).get("members", [])}
                 requester = source["input"]["sender"]
                 human = requester if source["room_id"] == self.config["member"].get("personalRoomId") and requester not in peers else None

@@ -22,11 +22,11 @@ Qoder authentication is separate from your AT gateway consumer token. Inject `QO
 
 For a trusted workstation-only probe, explicitly select `QODER_AUTH_MODE=local` and provide the local Qoder profile at `QODER_CONFIG_DIR`. The container defaults that directory to the member's private `.qoder` directory. Authentication files are never included in the transcript mirror.
 
-The required deployment route is **Qoder → Higress → your model provider**, including ordinary Model Studio Qwen models behind Higress. The adapter must consume the Controller-projected model, URL and Worker consumer key. No Qoder-service inference mode or automatic fallback is available in the runtime.
+The deployment route is **Qoder → Higress → your model provider**, using the standard OpenAI Chat Completions protocol. The adapter automatically consumes the Controller-projected Base URL, model ID and Worker consumer key. Ordinary Model Studio Qwen models and their upstream credentials stay behind Higress. There is no provider-catalog selection, manual BYOK setup, upstream API key injection or Qoder-service fallback in the runtime.
 
-**The current model binding is not verified for Higress.** It uses the SDK's inline `custom_model` callback and `QODER_BYOK_PROVIDER`, which select the server-side BYOK path. Requiring a catalog provider is a limitation of this initial binding, not an AgentTeams or Higress requirement. Do not provision a special provider or pass upstream Model Studio credentials to Workers to work around it.
+The adapter configures the pinned CLI's native `settings.providers` with `type=openai-compatible`, `protocol=openai`, `baseUrl`, `apiKey` and `model`, then selects `agentteams-gateway/<model>`. Every model-policy callback, including auxiliary purposes, returns that identifier as a string; it never sends inline `custom_model` credentials through the server-side BYOK path. `QODER_BYOK_PROVIDER` is no longer used. The pinned CLI's SDK custom-endpoint feature switch is set by the adapter, not by the operator.
 
-The pinned native CLI also implements a separate `settings.providers` direct path for an OpenAI-compatible Base URL, API key and model. An opt-in localhost probe of that path, including the CLI's SDK custom-base-URL feature switch, returned a model-service permission error before any HTTP request reached the fixture. This establishes neither successful Higress connectivity nor universal incompatibility: the current SDK/account combination remains blocked. The production binding has not been switched to this unverified path. Qoder authentication remains a separate SDK requirement.
+**Live gateway inference remains blocked with the tested SDK/account combination.** Qoder authentication and custom-endpoint permission checks still apply. A real SDK probe using the same direct settings did not expose the selected gateway model as enabled, failed its turn and sent zero requests to the local HTTP fixture. The runtime checks that the selected model is enabled before submitting input and fails explicitly otherwise. This is not a successful Higress inference claim; see the [evidence record](docs/acceptance.md). Changing an upstream Model Studio key cannot resolve a failure before the gateway is contacted.
 
 Gateway MCP endpoints on the projected model gateway origin receive the Worker gateway Bearer token. Other origins receive no gateway credential. Unsupported or missing configuration fails explicitly.
 
@@ -58,7 +58,7 @@ AT_SOURCE=/path/to/the/Core/candidate PYTHONPATH=/path/to/the/Core/candidate/sha
 
 # Direct endpoint diagnostic: real Qoder account checks, local HTTP fixture only.
 # A nonzero exit preserves the observed permission/connectivity failure.
-.venv/bin/python tests/live_direct_gateway_smoke.py --enable-sdk-direct
+.venv/bin/python tests/live_direct_gateway_smoke.py
 ```
 
 ## Deployment boundary

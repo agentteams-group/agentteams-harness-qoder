@@ -25,9 +25,7 @@ def load(path):
         raise ValueError("Qoder raw Matrix transport requires encryption=false")
     provider = projected["models"]["providers"]["agentteams-gateway"]
     selected = projected["agents"]["defaults"]["model"]["primary"].split("/", 1)[1]
-    return record, role, matrix, {"provider": "agentteams-gateway", "model": selected,
-                                "api_key": provider["apiKey"], "url": provider["baseUrl"],
-                                "style": "openai", "is_vl": False}
+    return record, role, matrix, {"model": selected, "api_key": provider["apiKey"], "url": provider["baseUrl"]}
 
 
 def instructions(record, role, plugin, member_home):
@@ -85,12 +83,16 @@ def authentication():
     raise ValueError("QODER_SERVICE_ACCOUNT_KEY or QODER_PERSONAL_ACCESS_TOKEN is required")
 
 
-def model_selection(projected):
-    provider = os.getenv("QODER_BYOK_PROVIDER")
-    if not provider:
-        raise ValueError("Higress mode requires QODER_BYOK_PROVIDER from your account's live BYOK catalog")
-    # An AT gateway provider is not a Qoder catalog identifier.
-    return {**projected, "provider": provider}
+def gateway_options(projected):
+    if not all(projected.get(field) for field in ("model", "url", "api_key")):
+        raise ValueError("Projected gateway model, URL and consumer key are required")
+    return {"model": "agentteams-gateway/" + projected["model"],
+            "settings": {"providers": {"agentteams-gateway": {
+                "type": "openai-compatible", "protocol": "openai",
+                "baseUrl": projected["url"], "apiKey": projected["api_key"], "model": projected["model"]}}},
+            # The pinned CLI gates SDK custom endpoints behind this feature switch.
+            # Normal Qoder authentication and account permission checks still apply.
+            "env": {"QODER_SDK_CUSTOM_BASE_URL_BYOK": "1"}}
 
 
 def external_mcp(record, gateway_key):

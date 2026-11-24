@@ -1,8 +1,58 @@
 import asyncio
+import json
+import os
+from pathlib import Path
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from agentteams_qoder.runtime import Runtime
+from test_config import record
+
+
+class GatewayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_routes_every_model_policy_purpose_to_direct_gateway(self):
+        from qoder_agent_sdk import qodercli_auth
+        from qoder_agent_sdk._internal.query import Query
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.home = Path("/tmp/qoder-member-fixture")
+        runtime.plugin = Path(os.environ["AT_SOURCE"]) / "plugins/teamharness"
+        runtime.config, runtime.role = record(), "worker"
+        runtime.model = {"model": "gateway-model", "url": "https://gateway/v1", "api_key": "fixture-gateway"}
+        runtime.matrix, runtime.recovery, runtime.store = Mock(), Mock(), Mock()
+        runtime.telemetry, runtime.pending_approvals = None, {}
+        runtime.prepare = Mock(return_value=({"role": "worker"}, "fixture"))
+        client = Mock()
+        client.return_value.__aenter__ = AsyncMock(return_value=client.return_value)
+        client.return_value.__aexit__ = AsyncMock(return_value=False)
+        client.return_value.get_available_models = AsyncMock(return_value=[])
+        client.return_value.query = AsyncMock()
+        with patch("worker_sessions.WorkerSessions.load", return_value={"config_generation": 1}), \
+                patch("worker_sessions.WorkerSessions.usable", return_value=False), \
+                patch("agentteams_qoder.native.NativeTurn.admit"), \
+                patch("agentteams_qoder.runtime.instructions", return_value="fixture"), \
+                patch("agentteams_qoder.runtime.authentication", return_value=qodercli_auth()), \
+                patch("qoder_agent_sdk.QoderSDKClient", client):
+            with self.assertRaisesRegex(RuntimeError, "OpenAI-compatible gateway"):
+                await runtime.execute({"event_id": "fixture", "room_id": "!dm:test", "input": {"content": {}}},
+                                      {"event_key": "fixture", "generation": 1})
+        options = client.call_args.kwargs["options"]
+        client.return_value.query.assert_not_awaited()
+        self.assertEqual(options.model, "agentteams-gateway/gateway-model")
+        self.assertEqual(options.settings["providers"]["agentteams-gateway"]["baseUrl"], "https://gateway/v1")
+        self.assertEqual(options.env["QODER_SDK_CUSTOM_BASE_URL_BYOK"], "1")
+        self.assertEqual(options.env["QODER_CONFIG_DIR"], str(runtime.home / ".qoder"))
+        transport = Mock(write=AsyncMock())
+        query = Query(transport, is_streaming_mode=True, resolve_model=options.resolve_model)
+        self.addCleanup(query._message_send.close)
+        self.addCleanup(query._message_receive.close)
+        for purpose in ("main", "compact", "tool_summary"):
+            await query._handle_control_request({"request_id": purpose,
+                "request": {"subtype": "get_model_policy", "purpose": purpose}})
+            response = json.loads(transport.write.await_args.args[0])["response"]["response"]
+            self.assertEqual(response["model"], options.model)
+            self.assertNotIn("custom_model", response)
+            self.assertNotIn("fixture-gateway", json.dumps(response))
 
 
 class ControlTests(unittest.IsolatedAsyncioTestCase):
