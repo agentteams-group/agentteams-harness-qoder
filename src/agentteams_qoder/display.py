@@ -57,10 +57,14 @@ class TurnDisplay:
         if not self.thinking:
             return
         if isinstance(message, AssistantMessage):
-            for index, block in enumerate(message.content):
-                if isinstance(block, ThinkingBlock):
-                    await self.publish("thinking:" + (message.message_id or message.uuid or str(index)),
-                        [{"type": "thinking", "content": block.thinking[:16000], "isStreaming": False}], "思考过程")
+            texts = [block.thinking for block in message.content if isinstance(block, ThinkingBlock)]
+            if not texts and self.fragments.get("text"):
+                texts = [self.fragments["text"]]
+            for index, text in enumerate(texts):
+                identity = self.fragments.get("id") if index == 0 else None
+                identity = identity or (message.message_id or message.uuid or "native") + ":" + str(index)
+                await self.publish("thinking:" + identity,
+                    [{"type": "thinking", "content": text[:16000], "isStreaming": False}], "思考过程")
             self.fragments.clear()
         elif isinstance(message, StreamEvent):
             event = message.event

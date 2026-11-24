@@ -1,12 +1,23 @@
 import unittest
 from unittest.mock import Mock
 
-from qoder_agent_sdk import AssistantMessage, ThinkingBlock
+from qoder_agent_sdk import AssistantMessage, ThinkingBlock, StreamEvent, TextBlock
 
 from agentteams_qoder.display import TurnDisplay
 
 
 class DisplayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_thinking_closes_its_existing_card_when_final_text_arrives(self):
+        client = Mock()
+        client.send_content.return_value = "$thinking"
+        display = TurnDisplay(client, {"room_id": "!room", "event_id": "$source"})
+        await display.message(StreamEvent("start", "session", {"type": "message_start", "message": {"id": "native"}}))
+        await display.message(StreamEvent("delta", "session", {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "Synthetic reasoning"}}))
+        await display.message(AssistantMessage([TextBlock("Final response")], "fixture", message_id="final"))
+        content = client.send_content.call_args.args[1]
+        self.assertEqual(content["m.relates_to"]["event_id"], "$thinking")
+        self.assertFalse(content["m.new_content"]["org.agentteams.run"]["blocks"][0]["isStreaming"])
+
     async def test_tool_terminal_edits_preserve_native_id_arguments_and_progress_flag(self):
         client = Mock()
         client.send_content.return_value = "$root"
