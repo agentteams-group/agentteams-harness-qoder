@@ -37,11 +37,25 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(Path(mcp.__file__).parent, PLUGIN / "mcp")
         self.assertTrue(common(PLUGIN, "task_context").task_write_path_allowed("a.txt", "/tmp/out", "/tmp/scratch"))
 
+    async def test_leader_schema_and_question_registration_follow_the_admitted_phase(self):
+        from mcp.types import ListToolsRequest
+        self.turn.context["role"] = "leader"
+        self.turn.context["planning"] = ["main"]
+        self.turn.ask = Mock()
+        server = self.turn.server()["instance"]
+        result = await server.request_handlers[ListToolsRequest](ListToolsRequest(method="tools/list"))
+        self.assertEqual([tool.name for tool in result.root.tools], ["task"])
+        actions = result.root.tools[0].inputSchema["properties"]["action"]["enum"]
+        self.assertIn("plan", actions)
+        self.assertIn("accept", actions)
+        self.assertNotIn("submit", actions)
+
     async def test_original_tool_id_is_journaled_before_execution(self):
         with patch.dict(os.environ, {"AGENTTEAMS_CONTROLLER_URL": ""}):
             self.turn.before("Read", {"file_path": "/tmp/a"}, "native-123")
         self.recovery.begin_tools.assert_called_once_with({"task_id": "t"}, [
-            {"id": "native-123", "name": "Read", "arguments": {"file_path": "/tmp/a"}, "read_only": True}])
+            {"id": "native-123", "name": "Read", "arguments": {"file_path": "/tmp/a"}, "read_only": True,
+             "pre_effect_error_codes": ["QODER_PERMISSION_DENIED"]}])
         self.turn.after("Read", "native-123", "file content")
         self.recovery.finish_tools.assert_called_once_with({"task_id": "t"}, "operation", [
             {"id": "native-123", "content": "file content"}])
@@ -112,6 +126,28 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         self.turn.operations["call"] = ("Bash", "operation")
         result = await self.turn.hook({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash", "error": "unknown"}, "call", None)
         self.assertIs(result["continue_"], False)
+
+    async def test_native_permission_denial_closes_only_the_exact_pre_effect_operation(self):
+        with patch.dict(os.environ, {"AGENTTEAMS_CONTROLLER_URL": ""}):
+            self.turn.before("Bash", {"command": "echo fixture"}, "native-denied")
+        result = await self.turn.hook({"hook_event_name": "PermissionDenied", "tool_name": "Bash",
+            "tool_use_id": "native-denied", "denial_reason": "Human rejected"}, "native-denied", None)
+        self.assertEqual(result, {})
+        receipt = self.recovery.finish_tools.call_args.args[2][0]
+        self.assertEqual((receipt["effect"], receipt["error_code"]), ("none", "QODER_PERMISSION_DENIED"))
+        from task_operation import begin, result_bytes
+        _, checkpoint = begin(None, "fixture", self.recovery.begin_tools.call_args.args[1])
+        self.assertTrue(result_bytes(checkpoint, checkpoint["operation"]["id"], [receipt]))
+        self.assertFalse(self.turn.operations)
+        await self.turn.hook({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash", "error": "Denied"}, "native-denied", None)
+        self.recovery.finish_tools.assert_called_once()
+
+    async def test_mismatched_native_permission_denial_cannot_close_another_tool(self):
+        self.turn.operations["other"] = ("Bash", "op")
+        result = await self.turn.hook({"hook_event_name": "PermissionDenied", "tool_name": "Write"}, "other", None)
+        self.assertFalse(result["continue_"])
+        self.assertIn("other", self.turn.operations)
+        self.recovery.finish_tools.assert_not_called()
 
     async def test_incomplete_scoped_turn_must_continue(self):
         self.turn.context["planning"] = ["main"]

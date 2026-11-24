@@ -16,12 +16,14 @@ class MatrixClient:
         with urlopen(request, timeout=timeout) as response:
             return json.load(response)
 
-    def send(self, room, content, transaction):
+    def send_content(self, room, content, transaction):
         return self.request("PUT", "/_matrix/client/v3/rooms/" + quote(room, safe="") +
                             "/send/m.room.message/" + quote(transaction, safe=""), content)["event_id"]
 
+    send = send_content
 
-def allowed(config, room, event, *, invitation=False):
+
+def allowed(config, room, event, *, invitation=False, control=False):
     """Evaluate projected policy for ordinary input; control packets use Core."""
     member, team = config["member"], config.get("team", {})
     if event.get("sender") == member["matrixUserId"]:
@@ -40,11 +42,13 @@ def allowed(config, room, event, *, invitation=False):
     sender = event.get("sender")
     if mode == "disabled" or sender in denied or "*" in denied:
         return False
-    if mode != "open" and sender not in [*accepted, *overrides.get(prefix + "AllowExtra", [])] and "*" not in accepted:
+    accepted = [*accepted, *overrides.get(prefix + "AllowExtra", [])]
+    operator = sender in {team.get("admin", {}).get("matrixUserId"), member.get("adminMatrixUserId")}
+    if mode != "open" and sender not in accepted and "*" not in accepted and not (control and operator):
         return False
     # Personal and execution rooms have explicit sender policies. General
     # team rooms require an actual mention to avoid agent reply loops.
-    if not invitation and not personal and room == team.get("teamRoomId"):
+    if not invitation and not personal and room == team.get("teamRoomId") and not (control and operator):
         mentions = (content.get("m.mentions") or {}).get("user_ids", [])
         return member["matrixUserId"] in mentions
     return True

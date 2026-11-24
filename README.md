@@ -15,6 +15,7 @@ The initial Core registration is on [`codex/qoder-harness-20261124`](https://git
 - Reuse Core's durable Matrix input ledger and per-device cursor. Mirror SDK-committed transcript rows transactionally to a private SQLite file and object storage before recording native input commitment. Reuse a session only when the public descriptor matches its actual digest and current authority; otherwise reconstruct from shared context.
 - Discover recoverable Tasks at startup without a new Matrix message. Saved replies use the public delivery-only path and deterministic transaction identity. The candidate includes the integration paths; real restart/switch acceptance remains open.
 - Export actual SDK assistant-response and native tool-hook spans over OTLP HTTP when enabled. Keep prompt and tool bodies out of exported spans. Token counts come only from SDK usage; missing counts are not manufactured. Collector verification remains open.
+- Publish native thinking and tool progress as shared `org.agentteams.run` blocks. Tool completion edits preserve the original call ID, parameters and start time. Progress is marked `org.agentteams.progress_only` so it cannot reopen another Agent's work.
 
 ## Authentication and Higress routing
 
@@ -56,6 +57,16 @@ AT_SOURCE=/path/to/the/Core/candidate \
 AT_SOURCE=/path/to/the/Core/candidate PYTHONPATH=/path/to/the/Core/candidate/shared/lib \
   .venv/bin/python tests/live_runtime_smoke.py
 
+# Same stubbed-authority boundary, with actual SDK supplement/interruption handling.
+AT_SOURCE=/path/to/the/Core/candidate PYTHONPATH=/path/to/the/Core/candidate/shared/lib \
+  .venv/bin/python tests/live_runtime_smoke.py --steer
+AT_SOURCE=/path/to/the/Core/candidate PYTHONPATH=/path/to/the/Core/candidate/shared/lib \
+  .venv/bin/python tests/live_runtime_smoke.py --stop
+
+# Real SDK question and tool denial, synthetic Human/Matrix/Controller only.
+AT_SOURCE=/path/to/the/Core/candidate \
+  .venv/bin/python tests/live_interaction_smoke.py --local-login
+
 # Direct endpoint diagnostic: real Qoder account checks, local HTTP fixture only.
 # A nonzero exit preserves the observed permission/connectivity failure.
 .venv/bin/python tests/live_direct_gateway_smoke.py
@@ -63,9 +74,11 @@ AT_SOURCE=/path/to/the/Core/candidate PYTHONPATH=/path/to/the/Core/candidate/sha
 
 ## Deployment boundary
 
-Select `runtime: qoder` and the exact built `spec.image` on your Worker, or reference that Worker as a Team Leader. Core intentionally requires an explicit image. Provide standard Controller URL/token, process identity, Matrix credentials, storage bindings and an unencrypted transport projection. The shared entrypoint reads role assets, restores the native mirror, starts the SDK adapter and reports `/healthz` after a successful Matrix sync.
+Select `runtime: qoder` and the exact built `spec.image` on your Worker, or reference that Worker as a Team Leader. Core intentionally requires an explicit image. Provide standard Controller URL/token, process identity, Matrix credentials, storage bindings and an unencrypted transport projection. The shared entrypoint reads role assets, restores the native mirror and starts the SDK adapter. `/healthz` requires a recent successful Matrix sync and an enabled projected native gateway model; gateway checking does not issue an inference request. Saved reply recovery can still proceed without model availability.
 
-Native permission requests create the existing Dashboard approval metadata. A standalone direct-message requester or the Team admin can use `/approve REQUEST_ID CONTEXT_ID` and `/reject REQUEST_ID CONTEXT_ID`; Team Agent senders cannot approve native side effects, and old request IDs cannot answer later turns. Direct message controls use `/cancel` and `/steer text`, with room/requester/run checks. Task cancellation remains owned by the public main Task. Full control-flow acceptance is pending.
+Native permission requests use the shared `org.agentteams.approval` contract with `reply_format=com.agentteams.answer` and an opaque context ID. Dashboard buttons resume the exact request after room, sender, request and context checks. Approval, rejection, cancellation and expiry have separate receipts. The requesting Human or Team admin can answer; Agent senders cannot authorize side effects. The native `ask_human` MCP tool and external MCP form elicitation use shared question cards with validated, lossless answers. Coordination decision phases retain only their public Task tool.
+
+Personal conversational turns advertise standard `com.agentteams.execution` states and consume `com.agentteams.control`. Stop persists its request before native interruption and reports `stopped` only after a terminal response with no unknown tool operation. Steer uses SDK `priority=next`, a stable Matrix-derived UUID, exact native input persistence and continued response reception. A queued native `attachment/queued_command` is verified by its source UUID and exact text. Accepted supplements retire only after persistence and consumption; uncertain interrupted operations remain fenced for verification. Late supplements remain ordinary follow-up input. Task cancellation remains owned by the public main Task. See [interaction fixes and measured boundaries](docs/interaction-alignment.md); full deployment/admission acceptance remains open.
 
 Keep startup and runtime logs under the shared bounded runtime logger. Native/session/config changes belong here; public protocol changes belong in [Core](https://github.com/agentscope-ai/AgentTeams). The [Harness integration guide](https://github.com/agentscope-ai/AgentTeams/blob/main/docs/design/harness-integration-guide.md) defines the admission gates.
 

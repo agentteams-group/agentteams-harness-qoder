@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from urllib.parse import quote
@@ -12,7 +13,9 @@ import uuid
 
 from .config import authentication, external_mcp, gateway_options, instructions, load
 from .core import common
-from .native import NativeTurn, TASK_TOOL
+from .native import ASK_TOOL, NativeTurn, TASK_TOOL
+from .display import TurnDisplay
+from .questions import form_answer, form_questions, validate_answers
 from .sessions import SessionStore
 from .transport import MatrixClient, allowed
 from .telemetry import NativeTrace, configure
@@ -34,9 +37,11 @@ class Runtime:
         self.inbox = RawWorkerSync(self.matrix, self.client, self.config["member"]["matrixUserId"],
                                     self.classify, self.observe_rooms)
         self.joined = set()
+        self.rooms_loaded = False
         self.active = None
-        self.pending_approvals = {}
+        self.pending_requests = {}
         self.last_sync = 0
+        self.gateway_ready, self.last_gateway_check = False, 0
         self.telemetry = configure()
         prefix = os.environ["AGENTTEAMS_STORAGE_PREFIX"].rstrip("/")
         member = self.config["member"]["runtimeName"]
@@ -54,11 +59,19 @@ class Runtime:
         if packet:
             coordination = packet["meta"]["teamharness_coordination"]
             return ("task_notification", coordination["task_id"]) if coordination["kind"] == "task_assigned" else ("message", None)
-        return ("message", None) if allowed(self.config, room, event) else None
+        content = event.get("content") or {}
+        body = content.get("body")
+        verb = re.sub(r"^(?:@\S+\s+)+", "", body.strip()).partition(" ")[0] if isinstance(body, str) else ""
+        control = ("com.agentteams.control" in content or "com.agentteams.answer" in content
+                   or verb in {"/approve", "/reject", "/cancel", "/steer"})
+        return ("message", None) if allowed(self.config, room, event, control=control) else None
 
     def observe_rooms(self, payload):
         from worker_matrix_raw import require_unencrypted_room
 
+        if not self.rooms_loaded:
+            self.joined = set(self.client.request("GET", "/_matrix/client/v3/joined_rooms")["joined_rooms"])
+            self.rooms_loaded = True
         for room, info in payload.get("rooms", {}).get("invite", {}).items():
             invites = info.get("invite_state", {}).get("events", [])
             if any(event.get("type") == "m.room.member" and event.get("state_key") == self.config["member"]["matrixUserId"]
@@ -73,45 +86,149 @@ class Runtime:
     async def permission(self, name, arguments, context):
         from qoder_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
-        active = self.active
-        if not active or not context.tool_use_id:
+        if not self.active or not context.tool_use_id:
             return PermissionResultDeny(message="No active native tool identity")
-        request_id = uuid.uuid4().hex
+        native = self.active["native"]
+        status, _ = await self.human_request("approval", context.tool_use_id, name,
+            parameters=json.dumps(arguments, ensure_ascii=False),
+            risk_details=getattr(context, "description", None) or getattr(context, "decision_reason", None) or "此工具需要你确认后执行",
+            signal=getattr(context, "signal", None))
+        if status != "approved":
+            # SDK 1.0.17 does not emit PermissionDenied after a host denial.
+            # This callback is the pre-dispatch gate; commit our own denial before returning it.
+            async with native.lock:
+                await asyncio.to_thread(native.permission_denied, name, context.tool_use_id, "Approval " + status)
+                if native.trace:
+                    native.trace.tool_end(context.tool_use_id, failed=True)
+                if native.display:
+                    await native.display.tool(name, context.tool_use_id, result="Approval " + status, failed=True, finished=True)
+        return PermissionResultAllow(updated_input=arguments) if status == "approved" else PermissionResultDeny(message="Approval " + status)
+
+    async def check_gateway(self):
+        """Check the configured native model without sending an inference request."""
+        from qoder_agent_sdk import QoderAgentOptions, QoderSDKClient
+
+        self.gateway_ready = False
+        self.last_gateway_check = time.monotonic()
+        gateway = gateway_options(self.model)
+        options = QoderAgentOptions(auth=authentication(), cwd=self.home / "workspace", tools=[], setting_sources=[],
+            model=gateway["model"], settings=gateway["settings"],
+            env={**gateway["env"], "QODER_CONFIG_DIR": str(self.home / ".qoder")})
+        async with QoderSDKClient(options=options) as client:
+            models = await client.get_available_models()
+            if not any(model.get("value") == gateway["model"] and model.get("isEnabled") for model in models):
+                raise ValueError("Qoder did not enable the projected gateway model")
+        self.gateway_ready = True
+
+    async def human_request(self, kind, native_id, tool, *, parameters="", risk_details="", questions=None, validator=None, signal=None):
+        active = self.active
+        admin = self.config.get("team", {}).get("admin", {}).get("matrixUserId")
+        if not active or active["cancelled"] or not (active.get("human") or admin):
+            return "cancelled", None
+        context_id = uuid.uuid5(uuid.NAMESPACE_URL, active["run"] + ":" + str(active["identity"]) + ":" + active.get("session", "")).hex
+        request_id = uuid.uuid5(uuid.NAMESPACE_URL, context_id + ":" + native_id).hex
         future = asyncio.get_running_loop().create_future()
-        self.pending_approvals[request_id] = (active["run"], future)
+        entry = {"run": active["run"], "room": active["room"], "context": context_id,
+                 "kind": kind, "future": future, "validator": validator}
+        self.pending_requests[request_id] = entry
         metadata = {"version": 1, "runtime": "qoder", "request_id": request_id,
-                    "context_id": active["run"], "status": "pending", "tool_name": name,
-                    "parameters": json.dumps(arguments, ensure_ascii=False),
+                    "reply_format": "com.agentteams.answer", "context_id": context_id,
+                    "status": "pending", "tool_name": tool, "parameters": parameters, "risk_details": risk_details,
                     "expires_at": int((time.time() + 300) * 1000)}
+        question = {"type": "confirmation", "confirmation_id": request_id, "tool_name": tool,
+                    "reply_format": "com.agentteams.answer", "status": "pending", "questions": questions,
+                    "requested_of": active.get("human") or admin, "expires_at": metadata["expires_at"]}
+        status, value, sent, cancelled = "cancelled", None, False, None
+        async def publish(state):
+            content = {"msgtype": "m.text", "body": ("请确认工具操作：" + tool if kind == "approval" else "请回答：" + tool)
+                       if state == "pending" else "人工请求已处理：" + state, "org.agentteams.progress_only": True}
+            if kind == "approval":
+                content["org.agentteams.approval"] = {**metadata, "status": state}
+            else:
+                content["org.agentteams.run"] = {"version": "1", "run_id": active["run"], "blocks": [{**question, "status": "cancelled" if state == "invalid" else state}]}
+            await asyncio.to_thread(self.client.send_content, active["room"], content, "qoder:request:" + request_id + ":" + state)
         try:
-            await asyncio.to_thread(self.client.send, active["room"],
-                {"msgtype": "m.text", "body": f"Qoder requests permission for {name}. Use /approve {request_id} {active['run']} or /reject {request_id} {active['run']}.",
-                 "org.agentteams.approval": metadata}, "qoder-approval:" + request_id)
-            approved = await asyncio.wait_for(asyncio.shield(future), timeout=300)
-            return PermissionResultAllow(updated_input=arguments) if approved else PermissionResultDeny(message="Human rejected this operation")
-        except TimeoutError:
-            return PermissionResultDeny(message="Approval expired")
+            await publish("pending")
+            sent = True
+            if signal:
+                cancelled = asyncio.create_task(signal.wait())
+            done, _ = await asyncio.wait([future, *([cancelled] if cancelled else [])], timeout=300,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if cancelled and cancelled in done:
+                status = "cancelled"
+            elif future in done:
+                status, value = future.result()
+            else:
+                status = "expired"
+            return status, value
         finally:
-            self.pending_approvals.pop(request_id, None)
-            status = ("approved" if future.result() else "rejected") if future.done() and not future.cancelled() else "expired"
-            await asyncio.to_thread(self.client.send, active["room"],
-                {"msgtype": "m.text", "body": "Qoder permission request closed.",
-                 "org.agentteams.approval": {**metadata, "status": status}},
-                "qoder-approval-closed:" + request_id)
+            self.pending_requests.pop(request_id, None)
+            if cancelled:
+                cancelled.cancel()
+                await asyncio.gather(cancelled, return_exceptions=True)
+            if not future.done():
+                future.cancel()
+            if sent:
+                await publish(status)
+
+    async def ask(self, arguments):
+        questions = arguments["questions"]
+        if not questions or len({q["id"] for q in questions}) != len(questions):
+            raise ValueError("Question IDs must be unique")
+        status, answers = await self.human_request("question", uuid.uuid4().hex, "ask_human", questions=questions,
+            validator=lambda responses: validate_answers(questions, responses))
+        return {"content": [{"type": "text", "text": json.dumps({"status": status, "answers": answers}, ensure_ascii=False)}],
+                "isError": status != "answered"}
+
+    async def elicitation(self, request):
+        if request.get("mode", "form") != "form":
+            return {"action": "cancel"}  # URL authorization is not a form answer.
+        schema = request.get("requestedSchema") or {}
+        questions = form_questions(schema)
+        while True:
+            status, content = await self.human_request("question", uuid.uuid4().hex,
+                request.get("message") or request["serverName"], questions=questions,
+                validator=lambda responses: form_answer(schema, questions, responses))
+            if status != "invalid":
+                return {"action": "accept", "content": content} if status == "answered" else {"action": "cancel"}
+
+    async def retire_control(self, item, *, operation=None, identity=None, result="Control ignored"):
+        if identity is None:
+            claim = await asyncio.to_thread(self.matrix.message_claim, item["key"])
+            if claim["recovery"] != "resume":
+                return
+            identity = claim["identity"]
+        if operation:
+            await asyncio.to_thread(self.matrix.message_finish_tools, identity, operation,
+                                    [{"id": item["event_id"], "content": result}])
+        await asyncio.to_thread(self.matrix.message_cancel, identity)
 
     async def control(self, item):
         from task_operation import admit
 
-        text = item["input"]["content"]["body"]
+        content = item["input"]["content"]
+        text = re.sub(r"^(?:@\S+\s+)+", "", content["body"].strip())
         verb, _, argument = text.partition(" ")
-        wire = item["input"]["content"].get("org.agentteams.execution_control")
-        if wire:
-            if not isinstance(wire, dict) or not self.active or wire.get("agent_id") != self.config["member"]["matrixUserId"] or wire.get("run_id") != self.active["run"]:
-                return False
+        wire, answer = content.get("com.agentteams.control"), content.get("com.agentteams.answer")
+        if wire is not None:
+            if (not isinstance(wire, dict) or wire.get("action") not in {"stop", "steer"}
+                    or wire.get("agent_id") != self.config["member"]["matrixUserId"]):
+                await self.retire_control(item)
+                return True
+            if not self.active or wire.get("run_id") != self.active["run"]:
+                if wire.get("action") == "steer":
+                    return False  # Preserve late supplements as ordinary follow-up input.
+                await self.retire_control(item)
+                return True
             verb = {"stop": "/cancel", "steer": "/steer"}.get(wire.get("action"), "")
             argument = text
-        if verb not in {"/cancel", "/steer", "/approve", "/reject"}:
+        if answer is not None:
+            verb = "/answer"
+        if verb not in {"/cancel", "/steer", "/approve", "/reject", "/answer"}:
             return False
+        if verb == "/answer" and answer is None:
+            await self.retire_control(item)
+            return True
         active = self.active
         sender = item["input"]["sender"]
         admin = self.config.get("team", {}).get("admin", {}).get("matrixUserId")
@@ -120,33 +237,76 @@ class Runtime:
         if authorized and sender != admin:
             authorized = sender == self.config["member"].get("adminMatrixUserId") or sender == active.get("human")
         if not authorized:
-            return False
-        key = item["key"]
-        claim = await asyncio.to_thread(self.matrix.message_claim, key)
-        if claim["recovery"] != "resume":
+            await self.retire_control(item)
             return True
-        admit(claim["execution"].get("checkpoint"))
-        identity = claim["identity"]
-        call = {"id": item["event_id"], "name": "qoder.control", "arguments": {"verb": verb, "run": active["run"]}}
-        operation = await asyncio.to_thread(self.matrix.message_begin_tools, identity, [call])
-        if verb in {"/approve", "/reject"}:
-            request_id, _, run = argument.strip().partition(" ")
-            pending = self.pending_approvals.get(request_id)
-            if pending and pending[0] == active["run"] and (not run or run == active["run"]):
-                if not pending[1].done():
-                    pending[1].set_result(verb == "/approve")
-        elif verb == "/cancel":
-            if active["kind"] != "message":
-                raise ValueError("Cancel the assigned Task through its public main Task")
-            await asyncio.to_thread(self.matrix.message_cancel, active["identity"])
-            await active["client"].interrupt()
-            active["cancelled"] = True
-        elif argument.strip():
-            await active["client"].query(argument.strip(), priority="now", message_uuid=str(uuid.uuid4()))
-        await asyncio.to_thread(self.matrix.message_finish_tools, identity, operation,
-                                [{"id": item["event_id"], "content": "native control acknowledged"}])
-        await asyncio.to_thread(self.matrix.message_cancel, identity)
-        return True
+        if answer is not None or verb in {"/approve", "/reject"}:
+            request_id, _, context_id = argument.strip().partition(" ")
+            if answer is not None:
+                if not isinstance(answer, dict) or answer.get("actor", sender) != sender:
+                    await self.retire_control(item)
+                    return True
+                request_id, context_id = answer.get("confirmation_id"), answer.get("context_id")
+            if not isinstance(request_id, str):
+                await self.retire_control(item)
+                return True
+            pending = self.pending_requests.get(request_id)
+            valid = (pending and pending["run"] == active["run"] and pending["room"] == item["room_id"]
+                     and not pending["future"].done())
+            if valid:
+                try:
+                    if pending["kind"] == "approval":
+                        if context_id != pending["context"]:
+                            raise ValueError("Approval context differs")
+                        status = answer.get("answer") if answer is not None else "approved" if verb == "/approve" else "rejected"
+                        if status not in {"approved", "rejected", "cancelled"}:
+                            raise ValueError("Invalid approval choice")
+                        result = None
+                    else:
+                        if not isinstance(answer, dict) or answer.get("kind") != "ask_user":
+                            raise ValueError("Structured question answers required")
+                        result = pending["validator"](answer.get("responses"))
+                        status = "answered"
+                except (ValueError, TypeError, KeyError, IndexError):
+                    if pending["kind"] == "question":
+                        pending["future"].set_result(("invalid", None))
+                    await self.retire_control(item)
+                    return True
+                pending["future"].set_result((status, result))
+            await self.retire_control(item)
+            return True
+        if not active.get("direct") or active["cancelled"]:
+            await self.retire_control(item)
+            return True
+        async with active["lock"]:
+            if self.active is not active or not active["accepting"] or active["native"].complete:
+                if verb == "/steer":
+                    return False
+                await self.retire_control(item)
+                return True
+            prompt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, item["event_id"]))
+            if prompt_id in active["inputs"]:
+                return True
+            claim = await asyncio.to_thread(self.matrix.message_claim, item["key"])
+            if claim["recovery"] != "resume":
+                return True
+            admit(claim["execution"].get("checkpoint"))
+            identity = claim["identity"]
+            call = {"id": item["event_id"], "name": "qoder.control", "arguments": {"verb": verb, "run": active["run"], "input_uuid": prompt_id}}
+            operation = await asyncio.to_thread(self.matrix.message_begin_tools, identity, [call])
+            entry = {"source": item, "identity": identity, "operation": operation, "committed": False,
+                     "consumed": False, "stop": verb == "/cancel", "text": argument.strip()}
+            active["inputs"][prompt_id] = entry
+            if verb == "/cancel":
+                active["cancelled"] = True
+                active["native"].cancelled = True
+                for pending in self.pending_requests.values():
+                    if not pending["future"].done():
+                        pending["future"].set_result(("cancelled", None))
+                await active["display"].status("stopping")
+                await active["client"].interrupt()
+            elif argument.strip():
+                await active["client"].query(argument.strip(), priority="next", message_uuid=prompt_id)
+            return True
 
     def prepare(self, source, *, recovered=None):
         from task_coordination import notification
@@ -182,13 +342,13 @@ class Runtime:
         return context, text
 
     async def execute(self, source, identity, *, recovered=None):
-        from qoder_agent_sdk import QoderAgentOptions, QoderSDKClient, HookMatcher, ResultMessage, AssistantMessage
+        from qoder_agent_sdk import QoderAgentOptions, QoderSDKClient, HookMatcher, ResultMessage, AssistantMessage, UserMessage
         from worker_sessions import WorkerSessions
 
         gateway = gateway_options(self.model)
         context, text = await asyncio.to_thread(self.prepare, source, recovered=recovered)
         kind = "task" if recovered else "message"
-        native = NativeTurn(self.plugin, context, recovery=self.recovery, matrix=self.matrix, kind=kind, identity=identity)
+        native = NativeTurn(self.plugin, context, recovery=self.recovery, matrix=self.matrix, kind=kind, identity=identity, ask=self.ask)
         await asyncio.to_thread(native.admit)
         work = {"kind": "task", "team_id": identity["team_id"], "task_id": identity["task_id"]} if recovered else {"kind": "message", "event_key": identity["event_key"]}
         sessions = WorkerSessions("qoder", recovery=self.recovery)
@@ -208,6 +368,21 @@ class Runtime:
         session_id = resume or str(uuid.uuid4())
         trace = NativeTrace(self.telemetry, role=self.role, source=source, identity=identity, session=session_id, context=context)
         native.trace = trace
+        from opentelemetry.context import attach, detach
+        trace_token = attach(trace.parent) if trace.parent else None
+        peers = {member.get("matrixUserId") for member in self.config.get("team", {}).get("members", [])}
+        requester = source["input"]["sender"]
+        human = requester if source["room_id"] == self.config["member"].get("personalRoomId") and requester not in peers else None
+        scoped = any(context.get(key) for key in ("planning", "execution", "review", "completion"))
+        direct = kind == "message" and human is not None and not scoped
+        policy = self.config.get("desired", {}).get("channels", {}).get("matrix", {})
+        display = TurnDisplay(self.client, source, direct=direct, thinking=not scoped and policy.get("show_thinking", True),
+                              tools=not policy.get("filter_tool_messages", False))
+        native.display = display
+        active = {"run": source["event_id"], "room": source["room_id"], "sender": requester,
+                  "human": human, "cancelled": False, "kind": kind, "identity": identity,
+                  "session": session_id, "direct": direct, "display": display, "native": native,
+                  "lock": asyncio.Lock(), "inputs": {}, "accepting": True}
         prompt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, source["event_id"]))
         persisted = asyncio.Event()
 
@@ -215,63 +390,96 @@ class Runtime:
             if key.get("subpath"):
                 raise ValueError("Nested transcripts are not supported by this candidate")
             for row in rows:
-                if row.get("type") == "user" and row.get("uuid") == prompt_id:
-                    if source.get("key"):
-                        snapshot = await asyncio.to_thread(self.matrix.native_input, source["key"])
+                queued = row.get("attachment") if row.get("type") == "attachment" else None
+                queued = queued if isinstance(queued, dict) and queued.get("type") == "queued_command" and not queued.get("isMeta") else None
+                native_id = queued.get("source_uuid") if queued else row.get("uuid")
+                entry = active["inputs"].get(native_id)
+                item = source if native_id == prompt_id else (entry or {}).get("source")
+                if (row.get("type") == "user" or queued) and item:
+                    if queued and entry:
+                        prompt = queued.get("prompt")
+                        if isinstance(prompt, list) and all(isinstance(part, dict) and part.get("type") == "text" for part in prompt):
+                            prompt = "".join(part["text"] for part in prompt)
+                        if prompt != entry["text"]:
+                            raise ValueError("Queued native input differs from the accepted supplement")
+                    if item.get("key"):
+                        snapshot = await asyncio.to_thread(self.matrix.native_input, item["key"])
                         digest = hashlib.sha256(self.store.encode(row).encode()).hexdigest()
-                        await asyncio.to_thread(self.matrix.native_committed, source["key"], snapshot,
-                                                session_id + ":" + prompt_id, digest)
-                    persisted.set()
+                        await asyncio.to_thread(self.matrix.native_committed, item["key"], snapshot,
+                                                session_id + ":" + native_id, digest)
+                    if native_id == prompt_id:
+                        persisted.set()
+                    elif entry:
+                        entry["committed"] = True
+                        trace.input_committed(item["event_id"])
 
-        self.store.committed = committed
         async def resolve_model(_context):
             trace.model_start(_context)
             return {"model": gateway["model"]}
 
         tools = [] if any(context.get(key) for key in ("planning", "review", "completion")) else ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
-        options = QoderAgentOptions(cwd=(context.get("context") or {}).get("outputDirectory") or str(self.home / "workspace"),
-            system_prompt=instructions(self.config, self.role, self.plugin, self.home) + "\nYour public Task tool is " + TASK_TOOL,
-            tools=tools, mcp_servers={"agentteams": native.server(), **(external_mcp(self.config, self.model["api_key"]) if tools else {})},
-            allowed_tools=[TASK_TOOL], disallowed_tools=["Task", "Agent", "TaskOutput", "TaskStop"],
-            strict_mcp_config=True, setting_sources=[], permission_mode="default", auth=authentication(),
-            can_use_tool=self.permission, hooks={
-                "PreToolUse": [HookMatcher(hooks=[native.hook])],
-                "PostToolUse": [HookMatcher(hooks=[native.hook])],
-                "PostToolUseFailure": [HookMatcher(hooks=[native.hook])],
-                "Stop": [HookMatcher(hooks=[native.stop])]},
-            resolve_model=resolve_model, session_store=self.store, session_store_flush="eager",
-            model=gateway["model"], settings=gateway["settings"],
-            env={**gateway["env"], "QODER_CONFIG_DIR": str(self.home / ".qoder")},
-            resume=resume, session_id=None if resume else session_id, max_turns=50)
         answer = None
+        failed = True
         try:
+            options = QoderAgentOptions(cwd=(context.get("context") or {}).get("outputDirectory") or str(self.home / "workspace"),
+                system_prompt=instructions(self.config, self.role, self.plugin, self.home) + "\nYour public Task tool is " + TASK_TOOL,
+                tools=tools, mcp_servers={"agentteams": native.server(), **(external_mcp(self.config, self.model["api_key"]) if tools else {})},
+                allowed_tools=[TASK_TOOL, ASK_TOOL], disallowed_tools=["Task", "Agent", "TaskOutput", "TaskStop"],
+                strict_mcp_config=True, setting_sources=[], permission_mode="default", auth=authentication(),
+                can_use_tool=self.permission, on_elicitation=self.elicitation, include_partial_messages=True,
+                hooks={name: [HookMatcher(hooks=[native.hook])] for name in
+                       ("PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionDenied")} | {"Stop": [HookMatcher(hooks=[native.stop])]},
+                resolve_model=resolve_model, session_store=self.store, session_store_flush="eager",
+                model=gateway["model"], settings=gateway["settings"],
+                env={**gateway["env"], "QODER_CONFIG_DIR": str(self.home / ".qoder")},
+                resume=resume, session_id=None if resume else session_id, max_turns=50)
+            self.store.committed = committed
             async with QoderSDKClient(options=options) as client:
                 models = await client.get_available_models()
                 if not any(model.get("value") == gateway["model"] and model.get("isEnabled") for model in models):
                     raise RuntimeError("Qoder did not enable the projected OpenAI-compatible gateway model; "
                                        "check Qoder SDK custom-endpoint support and account permissions")
-                peers = {member.get("matrixUserId") for member in self.config.get("team", {}).get("members", [])}
-                requester = source["input"]["sender"]
-                human = requester if source["room_id"] == self.config["member"].get("personalRoomId") and requester not in peers else None
-                if self.config.get("team") and requester != self.config["team"].get("admin", {}).get("matrixUserId"):
-                    human = None  # Team Agent senders cannot approve native side effects.
-                self.active = {"run": source["event_id"], "room": source["room_id"], "sender": source["input"]["sender"],
-                               "human": human, "client": client, "cancelled": False, "kind": kind, "identity": identity}
+                self.gateway_ready = True
+                active["client"] = client
+                self.active = active
                 status = await client.get_mcp_status()
                 registered = [tool for server in status.get("mcpServers", []) if server.get("name") == "agentteams"
                               for tool in server.get("tools", [])]
                 if not any(tool.get("name") in {"task", TASK_TOOL} for tool in registered):
                     raise ValueError("Qoder did not discover the registered public Task tool")
+                await display.status("running")
                 await client.query(text, message_uuid=prompt_id)
-                async for message in client.receive_response():
+                async for message in client.receive_messages():
+                    await display.message(message)
+                    if isinstance(message, UserMessage) and message.uuid in active["inputs"]:
+                        active["inputs"][message.uuid]["consumed"] = True
                     if isinstance(message, AssistantMessage):
                         trace.model_response(message)
                     if isinstance(message, ResultMessage):
-                        if message.is_error:
-                            raise RuntimeError("Qoder turn failed: " + "; ".join(message.errors or [str(message.subtype)]))
-                        answer = message.result or ""
-                if self.active["cancelled"]:
+                        async with active["lock"]:
+                            if active["cancelled"]:
+                                active["accepting"] = False
+                                break
+                            if message.is_error:
+                                raise RuntimeError("Qoder turn failed: " + "; ".join(message.errors or [str(message.subtype)]))
+                            if any(not entry["consumed"] for entry in active["inputs"].values()):
+                                continue  # An accepted supplement belongs to a following native response.
+                            active["accepting"] = False
+                            answer = message.result or ""
+                            break
+                if active["cancelled"]:
+                    for entry in active["inputs"].values():
+                        if entry["stop"]:
+                            await self.retire_control(entry["source"], operation=entry["operation"], identity=entry["identity"], result="Native interruption reached its terminal response")
+                    if native.operations:
+                        await display.status("unavailable")
+                        raise ValueError("An interrupted tool requires authoritative verification")
+                    await asyncio.to_thread(self.matrix.message_cancel, identity)
+                    await display.status("stopped")
+                    failed = False
                     raise asyncio.CancelledError()
+                if answer is None:
+                    raise ValueError("Qoder stream ended without a terminal response")
                 view = await asyncio.to_thread(sessions.load, work)
             if not persisted.is_set():
                 raise ValueError("Qoder did not persist the exact native user input")
@@ -279,21 +487,36 @@ class Runtime:
                 raise ValueError("Qoder ended with an unverified native tool operation")
             if any(context.get(key) for key in ("execution", "planning", "review", "completion")) and not native.complete:
                 raise ValueError("Qoder ended without a confirmed public Task receipt")
+            for entry in active["inputs"].values():
+                if not entry["committed"] or not entry["consumed"]:
+                    raise ValueError("Qoder did not commit and consume the accepted supplement")
+                await self.retire_control(entry["source"], operation=entry["operation"], identity=entry["identity"], result="Supplement committed and consumed in the native session")
             # Retain native cache only for the snapshot actually represented at
             # input admission. Changed Task checkpoints cause a fresh session.
             if view["config_generation"] == config_generation:
                 await asyncio.to_thread(sessions.remember, work, view, identity, session_id,
                                         self.store.digest(session_id), int(time.time()) + 86400)
+            failed = False
             return answer
         finally:
-            trace.close()
-            self.store.committed = None
-            self.active = None
-            for _, future in self.pending_approvals.values():
-                if not future.done():
-                    future.set_result(False)
+            active["accepting"] = False
+            try:
+                await display.close(failed=failed)
+                if failed:
+                    await display.status("unavailable" if native.operations else "failed")
+            finally:
+                try:
+                    trace.close()
+                finally:
+                    if trace_token is not None:
+                        detach(trace_token)
+                    self.store.committed = None
+                    self.active = None
+                    for pending in self.pending_requests.values():
+                        if not pending["future"].done():
+                            pending["future"].set_result(("cancelled", None))
 
-    async def deliver(self, room, identity, execution, text, *, task=False):
+    async def deliver(self, room, identity, execution, text, *, task=False, reply_to=None):
         from worker_matrix_delivery import confirm_bound
         from worker_matrix_raw import publish_raw_saved
 
@@ -303,25 +526,34 @@ class Runtime:
             else:
                 saved = self.matrix.message_checkpoint(identity, checkpoint)
             confirm_bound(saved["execution"], identity, "qoder", checkpoint)
+        content = {"org.agentteams.progress_only": True} if task else {}
+        if reply_to and reply_to.startswith("$"):
+            content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
         event = await asyncio.to_thread(publish_raw_saved, self.client, room, text, execution["checkpoint"],
                                         self.config["member"]["matrixUserId"], bind,
-                                        content={"org.agentteams.progress_only": True} if task else None)
+                                        content=content)
         if task:
             await asyncio.to_thread(self.recovery.delivered, identity["task_id"], identity["team_id"], event)
         else:
             await asyncio.to_thread(self.matrix.message_delivered, identity, event)
+        return event
 
     async def process_message(self, source):
         claimed = await asyncio.to_thread(self.matrix.message_claim, source["key"])
+        event = None
         if claimed["recovery"] == "deliver":
-            await self.deliver(source["room_id"], claimed["identity"], claimed["execution"], claimed["saved_result"])
+            event = await self.deliver(source["room_id"], claimed["identity"], claimed["execution"], claimed["saved_result"], reply_to=source["event_id"])
         elif claimed["recovery"] == "resume":
             if claimed.get("resume_text") and claimed["execution"].get("checkpoint"):
                 source = {**source, "input": {**source["input"], "content": {
                     **source["input"]["content"], "body": claimed["resume_text"]}}}
             answer = await self.execute(source, claimed["identity"])
             saved = await asyncio.to_thread(self.matrix.message_save_reply, claimed["identity"], answer)
-            await self.deliver(source["room_id"], claimed["identity"], saved["execution"], answer)
+            event = await self.deliver(source["room_id"], claimed["identity"], saved["execution"], answer, reply_to=source["event_id"])
+        if event:
+            direct = (source["room_id"] == self.config["member"].get("personalRoomId")
+                      and "org.agentteams.coordination" not in source["input"]["content"])
+            await TurnDisplay(self.client, source, direct=direct).status("completed", event)
 
     async def process_task(self, snapshot, entry, inputs):
         claimed = await asyncio.to_thread(self.recovery.claim, snapshot, entry)
@@ -362,9 +594,11 @@ class Runtime:
                 inputs = [dict(item, key=key) for key in snapshot["state"]["pending"]
                           if (item := await asyncio.to_thread(self.matrix.input, key))
                           and not snapshot["state"]["rooms"].get(item["room_id"], {}).get("gaps")]
+                consumed = set()
                 for item in inputs:
-                    if item["intent"] == "message":
-                        await self.control(item)
+                    if item["intent"] == "message" and await self.control(item):
+                        consumed.add(item["key"])
+                inputs = [item for item in inputs if item["key"] not in consumed]
                 if running and running.done():
                     try:
                         running.result()
@@ -372,8 +606,16 @@ class Runtime:
                         event("turn.failed", error_type=type(error).__name__, error=str(error))
                     running = None
                 if not running:
+                    previous_model = self.model
                     self.config, self.role, matrix, self.model = load(self.path)
                     self.client.config = matrix
+                    if previous_model != self.model:
+                        self.gateway_ready, self.last_gateway_check = False, 0
+                    if not self.gateway_ready and time.monotonic() - self.last_gateway_check >= 30:
+                        try:
+                            await self.check_gateway()
+                        except Exception as error:
+                            event("model.unavailable", error_type=type(error).__name__)
                     tasks = await asyncio.to_thread(self.recovery.discover)
                     if not gaps:
                         recovery_scanned()
@@ -382,12 +624,16 @@ class Runtime:
                         cp = execution.get("checkpoint") or {}
                         if execution.get("state") == "needs_verification" or (entry["task"]["status"] == "submitted" and cp.get("delivery") != "pending"):
                             continue
+                        if not self.gateway_ready and cp.get("delivery") != "pending":
+                            continue
                         if entry["task"].get("room_id") in self.joined:
                             running = asyncio.create_task(self.process_task(tasks, entry, inputs))
                             break
                     if not running:
                         for item in inputs:
                             cp = (item.get("execution") or {}).get("checkpoint") or {}
+                            if not self.gateway_ready and cp.get("delivery") != "pending":
+                                continue
                             if (item["intent"] == "message" and cp.get("delivery") != "delivered"
                                     and (item.get("execution") or {}).get("state") not in {"cancelled", "needs_verification"}
                                     and (cp.get("operation") or {}).get("state") not in {"started", "unknown"}):
@@ -403,11 +649,12 @@ def main():
     runtime = Runtime()
     class Health(BaseHTTPRequestHandler):
         def do_GET(self):
-            healthy = self.path == "/healthz" and time.monotonic() - runtime.last_sync < 30
+            healthy = self.path == "/healthz" and time.monotonic() - runtime.last_sync < 30 and runtime.gateway_ready
             self.send_response(200 if healthy else 503)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"ok": healthy, "runtime": "qoder", "active": runtime.active is not None}).encode())
+            self.wfile.write(json.dumps({"ok": healthy, "runtime": "qoder", "active": runtime.active is not None,
+                                        "model_ready": runtime.gateway_ready}).encode())
         def log_message(self, *_args):
             pass
     server = ThreadingHTTPServer(("0.0.0.0", 8088), Health)

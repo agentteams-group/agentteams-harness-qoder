@@ -7,12 +7,13 @@ from .core import common
 
 
 TASK_TOOL = "mcp__agentteams__task"
+ASK_TOOL = "mcp__agentteams__ask_human"
 READ_ONLY = frozenset({"Read", "Glob", "Grep"})
 FILE_WRITES = frozenset({"Write", "Edit"})
 
 
 class NativeTurn:
-    def __init__(self, plugin, context, *, recovery, matrix, kind, identity, trace=None):
+    def __init__(self, plugin, context, *, recovery, matrix, kind, identity, trace=None, ask=None):
         self.plugin, self.context = Path(plugin), context
         self.recovery, self.matrix, self.kind, self.identity = recovery, matrix, kind, identity
         self.operations = {}
@@ -21,10 +22,15 @@ class NativeTurn:
         self.registered = False
         self.lock = asyncio.Lock()
         self.trace = trace
+        self.ask, self.display = ask, None
+        self.cancelled = False
+        self.permission_denials = set()
 
     def admit(self):
         from task_operation import admit
 
+        if self.cancelled:
+            raise ValueError("This native turn was stopped")
         if self.complete:
             raise ValueError("The admitted Task phase is complete")
         if self.kind == "task":
@@ -62,8 +68,18 @@ class NativeTurn:
         schema = common(self.plugin, "task_native").invoke(
             {"operation": "schema", "role": self.context["role"]})
         definition = tool("task", schema["description"], schema["inputSchema"])(self.task)
+        tools = [definition]
+        if self.ask and not any(self.context.get(key) for key in ("planning", "review", "completion")):
+            tools.append(tool("ask_human", "Ask the authorized Human questions and wait for their actual answers.", {
+                "type": "object", "required": ["questions"], "additionalProperties": False,
+                "properties": {"questions": {"type": "array", "minItems": 1, "maxItems": 10, "items": {
+                    "type": "object", "required": ["id", "question"], "additionalProperties": False,
+                    "properties": {"id": {"type": "string", "minLength": 1}, "question": {"type": "string", "minLength": 1},
+                        "multi_select": {"type": "boolean"}, "options": {"type": "array", "items": {
+                            "type": "object", "required": ["id", "label"], "additionalProperties": False,
+                            "properties": {"id": {"type": "string", "minLength": 1}, "label": {"type": "string", "minLength": 1}}}}}}}}})(self.ask))
         self.registered = True
-        return create_sdk_mcp_server("agentteams", tools=[definition])
+        return create_sdk_mcp_server("agentteams", tools=tools)
 
     def before(self, name, arguments, call_id):
         if not call_id:
@@ -83,8 +99,9 @@ class NativeTurn:
                 raise ValueError("Write the file inside this Task's outputDirectory or scratchDirectory")
         self.admit()
         call = {"id": call_id, "name": name, "arguments": arguments}
-        if name in READ_ONLY:
+        if name in READ_ONLY or (name == ASK_TOOL and self.ask and self.registered):
             call["read_only"] = True
+        call["pre_effect_error_codes"] = ["QODER_PERMISSION_DENIED"]
         if self.kind == "task":
             operation = self.recovery.begin_tools(self.identity, [call])
         else:
@@ -93,6 +110,8 @@ class NativeTurn:
         return {}
 
     def after(self, name, call_id, response, *, failed=False, interrupted=False):
+        if call_id in self.permission_denials:
+            return  # The SDK's exact PermissionDenied event already closed this operation.
         if call_id in self.denied_before:
             self.denied_before.remove(call_id)
             return  # Your own PreToolUse denial prevented this dispatch.
@@ -115,24 +134,41 @@ class NativeTurn:
             self.matrix.message_finish_tools(self.identity, operation, [result])
         del self.operations[call_id]
 
+    def permission_denied(self, name, call_id, reason):
+        if call_id in self.denied_before or (name == TASK_TOOL and self.registered):
+            return
+        if call_id in self.permission_denials:
+            return
+        if call_id not in self.operations or self.operations[call_id][0] != name:
+            raise ValueError("Permission denial has no matching native admission")
+        _, operation = self.operations[call_id]
+        receipt = {"id": call_id, "content": reason, "status": "error", "effect": "none", "error_code": "QODER_PERMISSION_DENIED"}
+        finish = self.recovery.finish_tools if self.kind == "task" else self.matrix.message_finish_tools
+        finish(self.identity, operation, [receipt])
+        del self.operations[call_id]
+        self.permission_denials.add(call_id)
+
     async def hook(self, event, call_id, _options):
         async with self.lock:
             name = event.get("tool_name", "")
             call_id = call_id or event.get("tool_use_id")
             before = event["hook_event_name"] == "PreToolUse"
+            denied = event["hook_event_name"] == "PermissionDenied"
             try:
                 if before:
                     await asyncio.to_thread(self.before, name, event.get("tool_input") or {}, call_id)
                     if self.trace:
                         self.trace.tool_start(name, call_id)
                 else:
-                    await asyncio.to_thread(self.after, name, call_id,
-                        event.get("tool_response", event.get("error")),
-                        failed=event["hook_event_name"] == "PostToolUseFailure",
-                        interrupted=event.get("is_interrupt") is True)
+                    if denied:
+                        await asyncio.to_thread(self.permission_denied, name, call_id, event.get("denial_reason", "Permission denied"))
+                    else:
+                        await asyncio.to_thread(self.after, name, call_id,
+                            event.get("tool_response", event.get("error")),
+                            failed=event["hook_event_name"] == "PostToolUseFailure",
+                            interrupted=event.get("is_interrupt") is True)
                     if self.trace:
-                        self.trace.tool_end(call_id, event["hook_event_name"] == "PostToolUseFailure")
-                return {}
+                        self.trace.tool_end(call_id, denied or event["hook_event_name"] == "PostToolUseFailure")
             except Exception as error:
                 if not before:
                     if self.trace:
@@ -143,8 +179,15 @@ class NativeTurn:
                     self.denied_before.add(call_id)
                 return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
                     "permissionDecision": "deny", "permissionDecisionReason": str(error)}}
+            if self.display:
+                await self.display.tool(name, call_id, event.get("tool_input"),
+                    result=None if before else event.get("tool_response", event.get("error", event.get("denial_reason", "Completed"))),
+                    failed=denied or event["hook_event_name"] == "PostToolUseFailure", finished=not before)
+            return {}
 
     async def stop(self, _event, _call_id, _options):
+        if self.cancelled:
+            return {}
         if self.operations:
             return {"continue_": False, "stop_reason": "An outstanding tool operation requires verification"}
         scoped = any(self.context.get(key) for key in ("execution", "planning", "review", "completion"))

@@ -62,6 +62,15 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(allowed(config, "!dm:test", {**event, "sender": "@attacker:test"}))
         self.assertFalse(allowed(config, "!dm:test", {**event, "sender": "@worker:test"}))
 
+    def test_operator_control_does_not_bypass_explicit_channel_denial(self):
+        config = record()
+        config["team"] = {"teamRoomId": "!team:test", "admin": {"matrixUserId": "@human:test"}}
+        event = {"sender": "@human:test", "content": {"msgtype": "m.text", "body": "批准"}}
+        self.assertTrue(allowed(config, "!team:test", event, control=True))
+        self.assertFalse(allowed(config, "!team:test", event))
+        config["desired"]["channelPolicy"] = {"groupDenyExtra": ["@human:test"]}
+        self.assertFalse(allowed(config, "!team:test", event, control=True))
+
     def test_general_team_room_requires_structured_mention(self):
         config = record()
         config["team"] = {"teamRoomId": "!team:test"}

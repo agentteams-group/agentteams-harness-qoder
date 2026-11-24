@@ -48,6 +48,14 @@ class NativeTrace:
     def model_start(self, _context):
         self.model_started = time.time_ns()
 
+    def input_committed(self, event_id):
+        sources = json.loads(self.attributes["agentteams.input.event_ids"])
+        if event_id.startswith("$") and event_id not in sources:
+            sources.append(event_id)
+            self.attributes["agentteams.input.event_ids"] = json.dumps(sources)
+            if self.root:
+                self.root.set_attribute("agentteams.input.event_ids", json.dumps(sources))
+
     def model_response(self, message):
         identity = message.message_id or message.uuid
         if not self.tracer or not identity or identity in self.messages:

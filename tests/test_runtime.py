@@ -10,6 +10,26 @@ from test_config import record
 
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_readiness_requires_the_actual_gateway_model_without_running_inference(self):
+        from qoder_agent_sdk import qodercli_auth
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.home = Path("/tmp/qoder-readiness")
+        runtime.model = {"model": "fixture", "url": "https://gateway/v1", "api_key": "synthetic"}
+        client = Mock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get_available_models = AsyncMock(return_value=[])
+        with patch("qoder_agent_sdk.QoderSDKClient", return_value=client), \
+                patch("agentteams_qoder.runtime.authentication", return_value=qodercli_auth()):
+            with self.assertRaisesRegex(ValueError, "gateway model"):
+                await runtime.check_gateway()
+            self.assertFalse(runtime.gateway_ready)
+            client.get_available_models.return_value = [{"value": "agentteams-gateway/fixture", "isEnabled": True}]
+            await runtime.check_gateway()
+            self.assertTrue(runtime.gateway_ready)
+            client.query.assert_not_called()
+
     async def test_runtime_routes_every_model_policy_purpose_to_direct_gateway(self):
         from qoder_agent_sdk import qodercli_auth
         from qoder_agent_sdk._internal.query import Query
@@ -20,7 +40,8 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         runtime.config, runtime.role = record(), "worker"
         runtime.model = {"model": "gateway-model", "url": "https://gateway/v1", "api_key": "fixture-gateway"}
         runtime.matrix, runtime.recovery, runtime.store = Mock(), Mock(), Mock()
-        runtime.telemetry, runtime.pending_approvals = None, {}
+        runtime.telemetry, runtime.pending_requests = None, {}
+        runtime.client = Mock()
         runtime.prepare = Mock(return_value=({"role": "worker"}, "fixture"))
         client = Mock()
         client.return_value.__aenter__ = AsyncMock(return_value=client.return_value)
@@ -34,7 +55,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 patch("agentteams_qoder.runtime.authentication", return_value=qodercli_auth()), \
                 patch("qoder_agent_sdk.QoderSDKClient", client):
             with self.assertRaisesRegex(RuntimeError, "OpenAI-compatible gateway"):
-                await runtime.execute({"event_id": "fixture", "room_id": "!dm:test", "input": {"content": {}}},
+                await runtime.execute({"event_id": "fixture", "room_id": "!dm:test", "input": {"sender": "@human:test", "content": {}}},
                                       {"event_key": "fixture", "generation": 1})
         options = client.call_args.kwargs["options"]
         client.return_value.query.assert_not_awaited()
@@ -67,7 +88,10 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
                                "client": Mock(interrupt=AsyncMock(), query=AsyncMock()), "kind": "message",
                                "identity": {"event_key": "original"}, "cancelled": False}
         self.future = asyncio.get_running_loop().create_future()
-        self.runtime.pending_approvals = {"request": ("$run", self.future)}
+        self.runtime.active.update(direct=True, accepting=True, lock=asyncio.Lock(), inputs={},
+                                   native=Mock(complete=False), display=Mock(status=AsyncMock()))
+        self.runtime.pending_requests = {"request": {"run": "$run", "room": "!room", "context": "ctx",
+                                                    "future": self.future, "kind": "approval"}}
 
     def source(self, body, **kwargs):
         return {"key": "control", "event_id": "$control", "room_id": kwargs.get("room", "!room"),
@@ -76,31 +100,32 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_other_sender_and_room_cannot_approve(self):
         for source in (self.source("/approve request $run", sender="@other:test"),
                        self.source("/approve request $run", room="!other")):
-            self.assertFalse(await self.runtime.control(source))
+            self.assertTrue(await self.runtime.control(source))
         self.assertFalse(self.future.done())
-        self.runtime.matrix.message_claim.assert_not_called()
+        self.assertFalse(self.future.done())
 
     async def test_stale_context_does_not_approve_active_request(self):
         self.assertTrue(await self.runtime.control(self.source("/approve request $old")))
         self.assertFalse(self.future.done())
 
     async def test_matching_context_approves_exact_request(self):
-        self.assertTrue(await self.runtime.control(self.source("/approve request $run")))
-        self.assertTrue(self.future.result())
-        self.runtime.matrix.message_finish_tools.assert_called_once()
+        self.assertTrue(await self.runtime.control(self.source("@worker /approve request ctx")))
+        self.assertEqual(self.future.result(), ("approved", None))
+        self.runtime.matrix.message_cancel.assert_called_once()
 
-    async def test_cancel_persists_original_execution_before_native_interrupt(self):
+    async def test_cancel_persists_control_intent_before_native_interrupt(self):
         client = self.runtime.active["client"]
         self.assertTrue(await self.runtime.control(self.source("/cancel")))
-        self.assertEqual(self.runtime.matrix.message_cancel.call_args_list[0].args[0], {"event_key": "original"})
+        self.runtime.matrix.message_begin_tools.assert_called_once()
+        self.runtime.matrix.message_cancel.assert_not_called()
         client.interrupt.assert_awaited_once()
         self.assertTrue(self.runtime.active["cancelled"])
 
     async def test_late_structured_stop_does_not_touch_new_run(self):
         source = self.source("stop")
-        source["input"]["content"]["org.agentteams.execution_control"] = {
+        source["input"]["content"]["com.agentteams.control"] = {
             "agent_id": "@worker:test", "action": "stop", "run_id": "$old"}
-        self.assertFalse(await self.runtime.control(source))
+        self.assertTrue(await self.runtime.control(source))
         self.runtime.active["client"].interrupt.assert_not_awaited()
 
 
@@ -112,6 +137,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             "execution": {"checkpoint": {"result": "saved"}}, "saved_result": "saved response"}
         runtime.execute = AsyncMock()
         runtime.deliver = AsyncMock()
-        await runtime.process_message({"key": "key", "room_id": "!room"})
+        runtime.deliver.return_value = None
+        await runtime.process_message({"key": "key", "event_id": "$source", "room_id": "!room"})
         runtime.execute.assert_not_awaited()
         self.assertEqual(runtime.deliver.await_args.args[3], "saved response")
