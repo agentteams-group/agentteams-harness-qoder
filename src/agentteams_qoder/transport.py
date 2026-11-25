@@ -29,6 +29,8 @@ def allowed(config, room, event, *, invitation=False, control=False):
     if event.get("sender") == member["matrixUserId"]:
         return False
     content = event.get("content") or {}
+    if content.get("org.agentteams.progress_only") or "org.agentteams.run" in content:
+        return False
     if content.get("msgtype") != "m.text" or not isinstance(content.get("body"), str):
         return False
     personal = room == member.get("personalRoomId")
@@ -48,7 +50,7 @@ def allowed(config, room, event, *, invitation=False, control=False):
         return False
     # Personal and execution rooms have explicit sender policies. General
     # team rooms require an actual mention to avoid agent reply loops.
-    if not invitation and not personal and room == team.get("teamRoomId") and not (control and operator):
+    if not invitation and not personal and not (control and operator):
         mentions = (content.get("m.mentions") or {}).get("user_ids", [])
         return member["matrixUserId"] in mentions
     return True

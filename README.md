@@ -83,3 +83,13 @@ Personal conversational turns advertise standard `com.agentteams.execution` stat
 Keep startup and runtime logs under the shared bounded runtime logger. Native/session/config changes belong here; public protocol changes belong in [Core](https://github.com/agentscope-ai/AgentTeams). The [Harness integration guide](https://github.com/agentscope-ai/AgentTeams/blob/main/docs/design/harness-integration-guide.md) defines the admission gates.
 
 Licensed under Apache-2.0; see [LICENSE](LICENSE).
+
+## Explicit account-model validation
+
+The default route remains the projected gateway model. When the operator explicitly chooses a logged-in Qoder account model for local validation, set `QODER_MODEL_ROUTE=account`, `QODER_ACCOUNT_MODEL=auto` and `QODER_AUTH_MODE=local`. Supply the account profile privately under the member's Qoder config directory. Do not bake it into an image or commit it. This is an explicit alternative route, never a fallback after gateway failure. A recreated member needs its privately managed authentication restored.
+
+Task phases consume Core's minimal `model_context` projection and assigned Skill contents. A validated terminal Task tool result stops native continuation, with its exact receipt retained in the SDK transcript. The SDK joins MCP text parts; receipt verification parses only the leading JSON and matches the original tool call. Progress blocks and unaddressed Task-room messages are excluded from both new inputs and history. Prepared input/output file permissions are checked before accepting an SDK permission callback; other tools retain approval policy.
+
+`tests/live_phase_completion_smoke.py` is opt-in and uses a real logged-in account with synthetic Core effects. It verifies native persistence and no model continuation, not end-to-end Task admission certification.
+
+The matched Core contract is pinned to `f08cd8291c4004479660addb16fc7ecd7d08c591` ([Core PR #1725](https://github.com/agentscope-ai/AgentTeams/pull/1725)); build the Controller/CLI and shared assets from that same revision. Local mixed normal and rework Tasks are separate from full admission certification.

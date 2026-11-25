@@ -67,6 +67,7 @@ def instructions(record, role, plugin, member_home):
     sections.append("Use your registered native Task tool for Task operations. Read its verified receipts. "
                     "The task system delivers accepted outputs; do not duplicate task notifications. "
                     "Nested agents and background commands are unavailable in this candidate.")
+    sections.append("Your assigned Skills are already included above. Do not reread their files. In an execution phase, use Read for prepared input files and Write for your own reports; use Bash only when the work requires executing a command.")
     return "\n\n".join(sections)
 
 
@@ -84,6 +85,11 @@ def authentication():
 
 
 def gateway_options(projected):
+    route = os.getenv("QODER_MODEL_ROUTE", "gateway")
+    if route == "account":
+        return {"model": os.getenv("QODER_ACCOUNT_MODEL") or "auto", "settings": {}, "env": {}}
+    if route != "gateway":
+        raise ValueError("QODER_MODEL_ROUTE must be gateway or account")
     if not all(projected.get(field) for field in ("model", "url", "api_key")):
         raise ValueError("Projected gateway model, URL and consumer key are required")
     return {"model": "agentteams-gateway/" + projected["model"],

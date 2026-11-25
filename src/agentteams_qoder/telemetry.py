@@ -29,6 +29,14 @@ class NativeTrace:
             "agentteams.input.event_ids": json.dumps([source["event_id"]] if source["event_id"].startswith("$") else [])}
         if identity.get("task_id"):
             self.attributes["agentteams.task.id"] = identity["task_id"]
+        worker = os.getenv("AGENTTEAMS_WORKER_NAME", "unknown")
+        self.attributes["agentteams.worker.name"] = worker
+        team = identity.get("team_id") or context.get("team") or os.getenv("AGENTTEAMS_TEAM_NAME")
+        if team:
+            self.attributes["agentteams.team.id"] = team
+        tags = ["agentteams", "worker-turn", "qoder"]
+        tags.extend(label + ":" + self.attributes["agentteams." + label + ".id"] for label in ("task", "team", "room") if self.attributes.get("agentteams." + label + ".id"))
+        self.attributes.update({"langfuse.user.id": worker, "langfuse.session.id": session, "langfuse.trace.tags": tags})
         coordination = (source["input"].get("content", {}).get("org.agentteams.coordination") or {}).get("channel_meta", {}).get("teamharness_coordination") or {}
         for key in ("id", "kind"):
             if coordination.get(key):
@@ -42,7 +50,7 @@ class NativeTrace:
             from opentelemetry.propagate import extract
             carrier = (source["input"].get("content", {}).get("org.agentteams.coordination") or {}).get("channel_meta", {}).get("otel_carrier") or {}
             self.root = self.tracer.start_span("qoder.turn", context=extract(carrier),
-                attributes={**self.attributes, "gen_ai.operation.name": "invoke_agent"})
+                attributes={**self.attributes, "gen_ai.operation.name": "invoke_agent", "langfuse.observation.type": "agent"})
             self.parent = set_span_in_context(self.root)
 
     def model_start(self, _context):
@@ -61,7 +69,7 @@ class NativeTrace:
         if not self.tracer or not identity or identity in self.messages:
             return
         self.messages.add(identity)
-        fields = {**self.attributes, "gen_ai.operation.name": "chat", "gen_ai.provider.name": "qoder",
+        fields = {**self.attributes, "gen_ai.operation.name": "chat", "gen_ai.provider.name": "qoder", "langfuse.observation.type": "generation",
                   "gen_ai.response.model": message.model, "gen_ai.response.id": identity}
         usage = message.usage or {}
         for key in ("input_tokens", "output_tokens"):
@@ -76,7 +84,7 @@ class NativeTrace:
     def tool_start(self, name, identity):
         if self.tracer:
             self.tools[identity] = self.tracer.start_span("qoder.tool", context=self.parent, attributes={**self.attributes,
-                "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name, "gen_ai.tool.call.id": identity})
+                "gen_ai.operation.name": "execute_tool", "langfuse.observation.type": "tool", "gen_ai.tool.name": name, "gen_ai.tool.call.id": identity})
 
     def tool_end(self, identity, failed=False):
         span = self.tools.pop(identity, None)

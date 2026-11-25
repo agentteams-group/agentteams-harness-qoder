@@ -19,6 +19,8 @@ class NativeTurn:
         self.operations = {}
         self.denied_before = set()
         self.complete = False
+        self.completion = None
+        self.terminal_call_id = None
         self.registered = False
         self.lock = asyncio.Lock()
         self.trace = trace
@@ -56,10 +58,18 @@ class NativeTurn:
                 outcome = {"result": {"ok": False, "effect": "none", "message": str(error)}}
             self.context.update(outcome.get("contextUpdate") or {})
             result = outcome.get("result", outcome)
-            self.complete = outcome.get("phaseComplete") is True
-            parts = [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]
+            self.complete = outcome.get("phaseComplete") is True and bool(outcome.get("receiptId") and outcome.get("fact"))
+            if self.complete:
+                self.completion = outcome
+            visible = result
+            if self.complete:
+                task = result.get("task") or {}
+                visible = {"task": {key:task[key] for key in ("id","status","submissionId","completionId","planId") if key in task},
+                           "receiptId":outcome["receiptId"]}
+            parts = [{"type": "text", "text": json.dumps(visible, ensure_ascii=False)}]
             if outcome.get("fact"):
                 parts.append({"type": "text", "text": outcome["fact"]})
+            parts.extend({"type":"text","text":receipt["fact"]} for receipt in outcome.get("extraReceipts", []))
             return {"content": parts, "isError": result.get("ok") is False}
 
     def server(self):
@@ -176,7 +186,7 @@ class NativeTurn:
                     if self.trace:
                         self.trace.tool_end(call_id, failed=True)
                     # Do not let the next inference/tool proceed on an unknown operation.
-                    return {"continue_": False, "stop_reason": "Native tool receipt requires verification: " + type(error).__name__}
+                    return {"continue_": False, "stopReason": "Native tool receipt requires verification: " + type(error).__name__}
                 if call_id:
                     self.denied_before.add(call_id)
                 return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
@@ -185,13 +195,16 @@ class NativeTurn:
                 await self.display.tool(name, call_id, event.get("tool_input"),
                     result=None if before else event.get("tool_response", event.get("error", event.get("denial_reason", "Completed"))),
                     failed=denied or failed, finished=not before)
+            if name == TASK_TOOL and not before and not failed and self.complete:
+                self.terminal_call_id = call_id
+                return {"continue_": False, "stopReason": "Task phase completed"}
             return {}
 
     async def stop(self, _event, _call_id, _options):
         if self.cancelled:
             return {}
         if self.operations:
-            return {"continue_": False, "stop_reason": "An outstanding tool operation requires verification"}
+            return {"continue_": False, "stopReason": "An outstanding tool operation requires verification"}
         scoped = any(self.context.get(key) for key in ("execution", "planning", "review", "completion"))
         if scoped and not self.complete:
             await asyncio.to_thread(self.admit)

@@ -1,10 +1,13 @@
 #!/bin/bash
 set -euo pipefail
+# You emit native SDK spans directly; do not instrument the shared Python bridge twice.
+export PYTHONPATH="${PYTHONPATH#/opt/agentteams/scripts/lib/telemetry:}"
 if [ "${AGENTTEAMS_LOG_CAPTURED:-}" != 1 ]; then
     exec python3 /opt/agentteams/scripts/lib/runtime_supervisor.py --runtime qoder -- bash "$0" "$@"
 fi
 umask 077
 source /opt/agentteams/scripts/lib/agentteams-env.sh
+export PYTHONPATH="${PYTHONPATH#/opt/agentteams/scripts/lib/telemetry:}"
 QODER_MEMBER_HOME="${AGENTTEAMS_WORKER_HOME:-/root/agentteams-fs/agents/${AGENTTEAMS_WORKER_NAME:?}}"
 mkdir -p "${QODER_MEMBER_HOME}/runtime" "${QODER_MEMBER_HOME}/workspace" "${QODER_MEMBER_HOME}/shared"
 if ! ensure_mc_credentials || ! agentteams_mc_host_configured; then

@@ -89,6 +89,17 @@ class Runtime:
         if not self.active or not context.tool_use_id:
             return PermissionResultDeny(message="No active native tool identity")
         native = self.active["native"]
+        prepared = native.context.get("context") or {}
+        if native.context.get("execution") and name in {"Read", "Glob", "Grep", "Write", "Edit"}:
+            output = Path(prepared["outputDirectory"]).resolve()
+            path = (output / (arguments.get("file_path") or arguments.get("path") or ".")).resolve()
+            if name in {"Write", "Edit"}:
+                approved = common(self.plugin,"task_context").task_write_path_allowed(str(path), str(output), prepared["scratchDirectory"])
+            else:
+                roots = [output, Path(prepared["scratchDirectory"]).resolve(), *[Path(i["directory"]).resolve() for i in prepared.get("inputs",[]) if i.get("readOnly") and i.get("directory")]]
+                approved = any(path.is_relative_to(root) for root in roots)
+            if approved:
+                return PermissionResultAllow(updated_input=arguments)
         status, _ = await self.human_request("approval", context.tool_use_id, name,
             parameters=json.dumps(arguments, ensure_ascii=False),
             risk_details=getattr(context, "description", None) or getattr(context, "decision_reason", None) or "此工具需要你确认后执行",
@@ -311,7 +322,8 @@ class Runtime:
     def prepare(self, source, *, recovered=None):
         from task_coordination import notification
 
-        context = {"role": self.role, "sourceEvent": source["event_id"], "sources": []}
+        context = {"role": self.role, "sourceEvent": source["event_id"], "sources": [],
+                   "actor": self.config["member"]["matrixUserId"]}
         text = source["input"]["content"]["body"]
         packet = None
         if not recovered:
@@ -338,7 +350,7 @@ class Runtime:
             if prepared.get("ok") is False:
                 raise ValueError("Task preparation is not available")
             context.update(prepared)
-            text += "\n\n" + prepared.get("fact", "") + "\n" + json.dumps(prepared.get("context"), ensure_ascii=False)
+            text += "\n\n" + prepared.get("fact", "") + "\n" + json.dumps(common(self.plugin,"task_context").model_context(prepared.get("context") or {}), ensure_ascii=False)
         return context, text
 
     async def execute(self, source, identity, *, recovered=None):
@@ -460,12 +472,13 @@ class Runtime:
                             if active["cancelled"]:
                                 active["accepting"] = False
                                 break
-                            if message.is_error:
+                            if message.is_error and not native.complete:
                                 raise RuntimeError("Qoder turn failed: " + "; ".join(message.errors or [str(message.subtype)]))
                             if any(not entry["consumed"] for entry in active["inputs"].values()):
                                 continue  # An accepted supplement belongs to a following native response.
                             active["accepting"] = False
-                            answer = message.result or ""
+                            answer = ((native.completion.get("displayText") or native.completion["fact"])
+                                      if native.complete else message.result or "")
                             break
                 if active["cancelled"]:
                     for entry in active["inputs"].values():
@@ -485,6 +498,8 @@ class Runtime:
                 raise ValueError("Qoder did not persist the exact native user input")
             if native.operations:
                 raise ValueError("Qoder ended with an unverified native tool operation")
+            if native.complete and not self.store.has_task_receipt(session_id, native.terminal_call_id, native.completion["receiptId"]):
+                raise ValueError("Qoder did not persist its native terminal Task receipt")
             if any(context.get(key) for key in ("execution", "planning", "review", "completion")) and not native.complete:
                 raise ValueError("Qoder ended without a confirmed public Task receipt")
             for entry in active["inputs"].values():
@@ -516,7 +531,7 @@ class Runtime:
                         if not pending["future"].done():
                             pending["future"].set_result(("cancelled", None))
 
-    async def deliver(self, room, identity, execution, text, *, task=False, reply_to=None):
+    async def deliver(self, room, identity, execution, text, *, task=False, reply_to=None, run=None):
         from worker_matrix_delivery import confirm_bound
         from worker_matrix_raw import publish_raw_saved
 
@@ -527,6 +542,10 @@ class Runtime:
                 saved = self.matrix.message_checkpoint(identity, checkpoint)
             confirm_bound(saved["execution"], identity, "qoder", checkpoint)
         content = {"org.agentteams.progress_only": True} if task else {}
+        if task:
+            run = run or "recovery:" + identity["task_id"] + ":" + str(identity["generation"])
+            content.update({"org.agentteams.run_id": run,
+                "org.agentteams.run": {"version": "1", "run_id": run, "blocks": [{"type": "text", "text": text}]}})
         if reply_to and reply_to.startswith("$"):
             content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
         event = await asyncio.to_thread(publish_raw_saved, self.client, room, text, execution["checkpoint"],
@@ -541,6 +560,9 @@ class Runtime:
     async def process_message(self, source):
         claimed = await asyncio.to_thread(self.matrix.message_claim, source["key"])
         event = None
+        if claimed["recovery"] == "resume" and "org.agentteams.coordination" not in source["input"]["content"] and not self.classify(source["room_id"],{**source["input"],"event_id":source["event_id"]}):
+            await asyncio.to_thread(self.matrix.message_cancel,claimed["identity"])
+            return
         if claimed["recovery"] == "deliver":
             event = await self.deliver(source["room_id"], claimed["identity"], claimed["execution"], claimed["saved_result"], reply_to=source["event_id"])
         elif claimed["recovery"] == "resume":
@@ -579,7 +601,7 @@ class Runtime:
             source = {**source, "input": {**source["input"], "content": {**source["input"]["content"], "body": resume}}}
         answer = await self.execute(source, identity, recovered=claimed)
         saved, answer = await asyncio.to_thread(self.recovery.prepare_reply, identity["task_id"], identity["team_id"], answer)
-        await self.deliver(room, identity, saved["execution"], answer, task=True)
+        await self.deliver(room, identity, saved["execution"], answer, task=True, run=source["event_id"])
 
     async def run(self):
         from runtime_observability import event
