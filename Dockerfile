@@ -20,4 +20,8 @@ RUN pip install --no-cache-dir /opt/agentteams/qoder \
 COPY scripts/entrypoint.sh /opt/agentteams/entrypoint.sh
 ENV PYTHONPATH=/opt/agentteams/scripts/lib
 EXPOSE 8088
+COPY health_adapter.py /opt/agentteams/health_adapter.py
+RUN printf '#!/bin/sh\nexec python3 /opt/agentteams/health_adapter.py "$@"\n' > /opt/agentteams/harness-health \
+    && chmod 0755 /opt/agentteams/harness-health
+
 ENTRYPOINT ["/usr/bin/tini", "--", "bash", "/opt/agentteams/entrypoint.sh"]
