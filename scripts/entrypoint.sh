@@ -23,4 +23,7 @@ export TEAMHARNESS_WORKSPACE="${QODER_MEMBER_HOME}/workspace"
 export TEAMHARNESS_SHARED_DIR="${TEAMHARNESS_SHARED_DIR:-${AGENTTEAMS_SHARED_DIR:-${QODER_MEMBER_HOME}/shared}}"
 export AGENTTEAMS_PLUGIN_DIR=/opt/agentteams/plugins/teamharness
 python3 -m agentteams_qoder.bootstrap
+if [ -n "${AGENTTEAMS_STORAGE_PREFIX:-}" ]; then
+    python3 /opt/agentteams/scripts/lib/harness_health.py --runtime qoder --member "${AGENTTEAMS_WORKER_NAME}" --parent "$$" &
+fi
 exec agentteams-qoder
